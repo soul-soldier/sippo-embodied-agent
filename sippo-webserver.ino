@@ -2,19 +2,29 @@
 #include "sippo-secrets.h"
 
 char ssid[] = SECRET_SSID;
-char pass[] = SECRET_PASS;  // your network password between the " "
-int keyIndex = 0;              // your network key Index number (needed only for WEP)
-int status = WL_IDLE_STATUS;   //connection status
-WiFiServer server(80);         //server socket
+char pass[] = SECRET_PASS;    // your network password between the " "
+int keyIndex = 0;             // your network key Index number (needed only for WEP)
+int status = WL_IDLE_STATUS;  //connection status
+WiFiServer server(80);        //server socket
 
 WiFiClient client = server.available();
 
-int ledPin = 2;
+// int ledPin = 2;
+const int PIN_RED = 5;
+const int PIN_GREEN = 6;
+const int PIN_BLUE = 9;
 
 void setup() {
   Serial.begin(9600);
-  pinMode(ledPin, OUTPUT);
-  while (!Serial);
+
+  // pinMode(ledPin, OUTPUT);
+  pinMode(PIN_RED, OUTPUT);
+  pinMode(PIN_GREEN, OUTPUT);
+  pinMode(PIN_BLUE, OUTPUT);
+  setRGB(0, 0, 0);
+
+  while (!Serial)
+    ;
 
   enable_WiFi();
   connect_WiFi();
@@ -79,6 +89,12 @@ void connect_WiFi() {
   }
 }
 
+void setRGB(int redValue, int greenValue, int blueValue) {
+  analogWrite(PIN_RED, redValue);
+  analogWrite(PIN_GREEN, greenValue);
+  analogWrite(PIN_BLUE, blueValue);
+}
+
 void printWEB() {
 
   if (client) {                    // if you get a client,
@@ -100,9 +116,11 @@ void printWEB() {
             client.println("Content-type:text/html");
             client.println();
 
-            //create the buttons
-            client.print("Click <a href=\"/H\">here</a> turn the LED on<br>");
-            client.print("Click <a href=\"/L\">here</a> turn the LED off<br><br>");
+            client.print("<h1>RGB LED Control</h1>");
+            client.print("<a href=\"/C1\">Cyan #00C9CC</a><br>");
+            client.print("<a href=\"/C2\">Pink #F7788A</a><br>");
+            client.print("<a href=\"/C3\">Green #34A853</a><br>");
+            client.print("<a href=\"/OFF\">Off</a><br><br>");
 
             int randomReading = analogRead(A1);
             client.print("Random reading from analog pin: ");
@@ -122,11 +140,23 @@ void printWEB() {
           currentLine += c;      // add it to the end of the currentLine
         }
 
-        if (currentLine.endsWith("GET /H")) {
-          digitalWrite(ledPin, HIGH);
+        if (currentLine.endsWith("GET /C1")) {
+          // color code #00C9CC
+          setRGB(0, 201, 204);
         }
-        if (currentLine.endsWith("GET /L")) {
-          digitalWrite(ledPin, LOW);
+
+        if (currentLine.endsWith("GET /C2")) {
+          // color code #F7788A
+          setRGB(252, 0, 183);
+        }
+
+        if (currentLine.endsWith("GET /C3")) {
+          // color code #34A853
+          setRGB(1, 255, 0);
+        }
+
+        if (currentLine.endsWith("GET /OFF")) {
+          setRGB(0, 0, 0);
         }
       }
     }
