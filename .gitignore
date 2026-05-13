@@ -1,0 +1,12 @@
+# Do not publish real Wi-Fi credentials
+sippo-secrets.h
+
+# Arduino / build output
+build/
+*.hex
+*.elf
+
+# OS/editor clutter
+.DS_Store
+Thumbs.db
+.vscode/
