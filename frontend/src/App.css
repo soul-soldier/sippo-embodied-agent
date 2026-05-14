@@ -1,0 +1,155 @@
+:root {
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  color: #f6f7fb;
+  background: #11131a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: #11131a;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.card {
+  width: min(100%, 560px);
+  padding: 32px;
+  border-radius: 28px;
+  background: #1b1f2a;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 35%);
+  border: 1px solid rgb(255 255 255 / 8%);
+}
+
+.eyebrow {
+  margin: 0 0 12px;
+  color: #9aa4bd;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(2rem, 5vw, 3.5rem);
+  line-height: 1;
+}
+
+.description {
+  margin: 16px 0 28px;
+  color: #b8c0d4;
+}
+
+.field {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 24px;
+  color: #d9def0;
+  font-weight: 600;
+}
+
+.field input {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid rgb(255 255 255 / 12%);
+  background: #11131a;
+  color: #f6f7fb;
+  outline: none;
+}
+
+.field input:focus {
+  border-color: #7c8cff;
+}
+
+.button-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.color-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 56px;
+  border: 0;
+  border-radius: 18px;
+  color: #f6f7fb;
+  background: #2a3040;
+  cursor: pointer;
+  transition:
+    transform 140ms ease,
+    background 140ms ease,
+    opacity 140ms ease;
+}
+
+.color-button:hover:not(:disabled) {
+  transform: translateY(-2px);
+  background: #343b50;
+}
+
+.color-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.color-button.active {
+  outline: 2px solid #f6f7fb;
+  outline-offset: 2px;
+}
+
+.swatch {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  border-radius: 999px;
+  border: 1px solid rgb(255 255 255 / 45%);
+  background: #11131a;
+}
+
+.status-box,
+.error-box {
+  margin-top: 20px;
+  padding: 14px 16px;
+  border-radius: 16px;
+}
+
+.status-box {
+  color: #dfe6ff;
+  background: rgb(124 140 255 / 14%);
+}
+
+.error-box {
+  color: #ffd7d7;
+  background: rgb(255 80 80 / 16%);
+}
+
+@media (max-width: 520px) {
+  .card {
+    padding: 24px;
+  }
+
+  .button-grid {
+    grid-template-columns: 1fr;
+  }
+}
