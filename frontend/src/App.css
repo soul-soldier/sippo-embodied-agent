@@ -49,15 +49,17 @@ input {
 
 h1 {
   margin: 0;
-  font-size: clamp(2rem, 5vw, 3.5rem);
+  font-size: clamp(1.5rem, 5vw, 2.5rem);
   line-height: 1;
+  padding-bottom: 1rem;
 }
 
-.description {
-  margin: 16px 0 28px;
-  color: #b8c0d4;
+.ip-field-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 24px;
 }
-
 .field {
   display: grid;
   gap: 8px;
@@ -152,4 +154,54 @@ h1 {
   .button-grid {
     grid-template-columns: 1fr;
   }
+}
+
+.sippo-display {
+  margin: 1.5rem 0;
+  padding: 1rem;
+  border-radius: 1.25rem;
+  transition: background-color 250ms ease;
+}
+
+.sippo-screen {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 260px;
+  padding: 1rem;
+  border-radius: 1rem;
+  background: rgba(255, 255, 255, 0.4);
+  overflow: hidden;
+}
+
+.sippo-fish {
+  width: min(280px, 80vw);
+  height: auto;
+  image-rendering: auto;
+}
+
+.sippo-state-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.sippo-state-grid div {
+  padding: 0.75rem;
+  border-radius: 0.75rem;
+  background: rgba(255, 255, 255, 0.7);
+}
+
+.sippo-state-grid span {
+  display: block;
+  font-size: 0.75rem;
+  opacity: 0.75;
+  color: #11131a;
+}
+
+.sippo-state-grid strong {
+  display: block;
+  margin-top: 0.2rem;
+  color: black;
 }
