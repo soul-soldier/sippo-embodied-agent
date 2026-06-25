@@ -93,8 +93,8 @@
 // Pin configuration
 // ------------------------------------------------------------
 
-const int HX711_DT_PIN = 3;
-const int HX711_SCK_PIN = 2;
+const int HX711_DT_PIN = 4;
+const int HX711_SCK_PIN = 5;
 
 // Startwert. Dieser Wert ist fast sicher noch nicht perfekt.
 // Du kannst ihn morgen live ueber den Serial Monitor veraendern.
@@ -102,7 +102,7 @@ const int HX711_SCK_PIN = 2;
 // Hinweis:
 // Bei vielen Setups muss der Faktor negativ sein. Wenn deine Werte
 // beim Auflegen eines Gewichts negativ werden, aendere das Vorzeichen.
-const float START_CALIBRATION_FACTOR = -7050.0;
+const float START_CALIBRATION_FACTOR = 421.0;
 
 // Wie viele Einzelmessungen pro Anzeige gemittelt werden.
 // Hoeher = stabiler, aber langsamer.
@@ -198,18 +198,24 @@ void setup()
 
   scale.begin(HX711_DT_PIN, HX711_SCK_PIN);
 
-  if (!scale.is_ready())
-  {
-    Serial.println(F("HX711 not ready."));
-    Serial.println(F("Check VCC, GND, DT, SCK and the selected pins."));
-    Serial.println(F("The sketch will continue trying to read values."));
+  Serial.println(F("Waiting for HX711..."));
+
+  while (!scale.is_ready()) {
+    Serial.println(F("HX711 not ready yet. Check wiring if this continues."));
+    delay(500);
   }
+
+  Serial.println(F("HX711 ready."));
 
   applyCalibrationFactor();
 
+  Serial.println(F("Taring... do not touch the scale."));
+  delay(1000);
+  scale.tare(20);
+  Serial.println(F("Tare complete."));
   // Tara: aktuelles Gewicht wird als 0 g gesetzt.
   // Wichtig: Beim Einschalten/Reset darf noch kein Testgewicht aufliegen.
-  scale.tare();
+
 
   Serial.println(F("Tare complete."));
   Serial.println(F("Place a known weight on the scale now."));
