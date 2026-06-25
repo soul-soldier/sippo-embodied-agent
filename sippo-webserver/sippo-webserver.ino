@@ -1,5 +1,6 @@
 #include <WiFiNINA.h>
 #include <Adafruit_NeoPixel.h>
+#include "HX711.h"
 #include "sippo-secrets.h"
 
 char ssid[] = SECRET_SSID;
@@ -20,6 +21,49 @@ Adafruit_NeoPixel ledRing(
   LED_RING_PIN,
   NEO_GRB + NEO_KHZ800
 );
+
+// ------------------------------------------------------------
+// Scale / HX711 configuration
+// ------------------------------------------------------------
+
+// Wiring:
+// HX711 DT  -> Arduino pin 4
+// HX711 SCK -> Arduino pin 5
+// HX711 VCC -> 5V or 3.3V, depending on your module/board
+// HX711 GND -> GND
+const int HX711_DT_PIN = 4;
+const int HX711_SCK_PIN = 5;
+
+// Calibrated with the 341 g bottle:
+// raw-ish value around 143548 / 341 g = ~421
+const float SCALE_CALIBRATION_FACTOR = 421.0;
+
+// Read the scale periodically, not on every loop iteration.
+// This keeps the webserver responsive.
+const unsigned long SCALE_READ_INTERVAL_MS = 500UL;
+const unsigned long SCALE_STARTUP_WAIT_MS = 5000UL;
+const int SCALE_READINGS_PER_SAMPLE = 3;
+
+// Exponential smoothing for display/debug output.
+// 0.0 = no movement, 1.0 = no smoothing.
+const float SCALE_SMOOTHING_ALPHA = 0.25;
+
+HX711 scale;
+
+bool scaleReady = false;
+bool scaleTared = false;
+
+float lastWeightGrams = 0.0;
+float smoothedWeightGrams = 0.0;
+bool smoothedWeightInitialized = false;
+
+unsigned long lastScaleReadAt = 0;
+
+// Forward declarations for scale helper overloads.
+void setupScale();
+void updateScaleReading();
+void updateScaleReading(bool forceRead);
+void tareScale();
 
 // ------------------------------------------------------------
 // Sippo configuration
@@ -114,6 +158,8 @@ void setup() {
   while (!Serial)
     ;
 
+  setupScale();
+
   enable_WiFi();
   connect_WiFi();
 
@@ -127,6 +173,11 @@ void loop() {
   // Later, real sensor adapters will be called here.
   // pollSensorAdapters();
 
+  // For now the scale is read-only and only exposed through /api/state.
+  // Automatic Sippo events from the scale will be added after we observe
+  // stable real-world bottle/full/sip/refill values.
+  updateScaleReading();
+
   updateSippoStateMachine();
 
   WiFiClient client = server.available();
@@ -134,6 +185,108 @@ void loop() {
   if (client) {
     handleClient(client);
   }
+}
+
+// ------------------------------------------------------------
+// Scale / HX711 helpers
+// ------------------------------------------------------------
+
+void setupScale() {
+  Serial.println(F("Setting up HX711 scale..."));
+
+  scale.begin(HX711_DT_PIN, HX711_SCK_PIN);
+
+  unsigned long startedWaitingAt = millis();
+
+  while (!scale.is_ready() && millis() - startedWaitingAt < SCALE_STARTUP_WAIT_MS) {
+    Serial.println(F("HX711 not ready yet. Waiting..."));
+    delay(500);
+  }
+
+  if (!scale.is_ready()) {
+    Serial.println(F("HX711 not ready. Webserver will continue without live scale readings."));
+    Serial.println(F("Check VCC, GND, DT, SCK and the selected pins."));
+    scaleReady = false;
+    scaleTared = false;
+    return;
+  }
+
+  scaleReady = true;
+  scale.set_scale(SCALE_CALIBRATION_FACTOR);
+
+  Serial.println(F("HX711 ready."));
+  Serial.println(F("Taring scale... leave the platform empty."));
+  delay(1000);
+  scale.tare(20);
+
+  scaleTared = true;
+  smoothedWeightInitialized = false;
+  lastScaleReadAt = 0;
+
+  updateScaleReading(true);
+
+  Serial.println(F("Scale tare complete."));
+}
+
+void updateScaleReading() {
+  updateScaleReading(false);
+}
+
+void updateScaleReading(bool forceRead) {
+  unsigned long now = millis();
+
+  if (!forceRead && now - lastScaleReadAt < SCALE_READ_INTERVAL_MS) {
+    return;
+  }
+
+  if (!scale.is_ready()) {
+    scaleReady = false;
+    return;
+  }
+
+  scaleReady = true;
+
+  if (!scaleTared) {
+    return;
+  }
+
+  lastWeightGrams = scale.get_units(SCALE_READINGS_PER_SAMPLE);
+
+  if (!smoothedWeightInitialized) {
+    smoothedWeightGrams = lastWeightGrams;
+    smoothedWeightInitialized = true;
+  } else {
+    smoothedWeightGrams =
+      (SCALE_SMOOTHING_ALPHA * lastWeightGrams) +
+      ((1.0 - SCALE_SMOOTHING_ALPHA) * smoothedWeightGrams);
+  }
+
+  lastScaleReadAt = millis();
+}
+
+void tareScale() {
+  Serial.println(F("Manual scale tare requested."));
+
+  if (!scale.is_ready()) {
+    Serial.println(F("Cannot tare: HX711 is not ready."));
+    scaleReady = false;
+    scaleTared = false;
+    return;
+  }
+
+  scaleReady = true;
+  scale.set_scale(SCALE_CALIBRATION_FACTOR);
+
+  Serial.println(F("Taring scale... leave the platform empty."));
+  scale.tare(20);
+
+  scaleTared = true;
+  smoothedWeightInitialized = false;
+  lastScaleReadAt = 0;
+
+  updateScaleReading(true);
+
+  Serial.println(F("Manual scale tare complete."));
 }
 
 // ------------------------------------------------------------
@@ -596,6 +749,26 @@ void sendStateJson(WiFiClient& client, const char* message) {
   client.print(F(",\"goalReached\":"));
   client.print(sippo.goalReached ? F("true") : F("false"));
 
+  updateScaleReading();
+
+  client.print(F(",\"scaleReady\":"));
+  client.print(scaleReady ? F("true") : F("false"));
+
+  client.print(F(",\"scaleTared\":"));
+  client.print(scaleTared ? F("true") : F("false"));
+
+  client.print(F(",\"weightGrams\":"));
+  client.print(lastWeightGrams, 1);
+
+  client.print(F(",\"smoothedWeightGrams\":"));
+  client.print(smoothedWeightGrams, 1);
+
+  client.print(F(",\"scaleCalibrationFactor\":"));
+  client.print(SCALE_CALIBRATION_FACTOR, 1);
+
+  client.print(F(",\"scaleLastReadAgeMs\":"));
+  client.print(lastScaleReadAt == 0 ? 0 : millis() - lastScaleReadAt);
+
   client.println(F("}"));
 }
 
@@ -633,6 +806,16 @@ void handleClient(WiFiClient& client) {
   else if (requestLine.startsWith("GET /api/state")) {
     updateSippoStateMachine();
     sendStateJson(client, "Current Sippo state");
+  }
+
+  else if (requestLine.startsWith("GET /api/scale/tare")) {
+    tareScale();
+
+    if (scaleReady && scaleTared) {
+      sendStateJson(client, "Scale tared");
+    } else {
+      sendStateJson(client, "Scale tare failed - HX711 not ready");
+    }
   }
 
   else if (requestLine.startsWith("GET /api/event/sip")) {
@@ -700,6 +883,15 @@ void handleClient(WiFiClient& client) {
 void pollSensorAdapters() {
   // Later, real hardware detection should call the same event dispatcher
   // that the current Wizard-of-Oz web buttons use.
+  //
+  // The HX711 scale is already read in updateScaleReading(), but for now
+  // it is intentionally read-only. After collecting stable values for:
+  // - empty platform
+  // - empty bottle
+  // - full bottle
+  // - one sip
+  // - refill
+  // we can compare smoothedWeightGrams against thresholds here.
 
   // Example:
   //
