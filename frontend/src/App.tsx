@@ -29,6 +29,15 @@ type SippoStateResponse = {
   goalPercent: number
   bottleFillPercent: number
   goalReached: boolean
+
+  // Added by the scale-enabled Arduino endpoint.
+  // Marked optional so the frontend still works with older sketches.
+  scaleReady?: boolean
+  scaleTared?: boolean
+  weightGrams?: number
+  smoothedWeightGrams?: number
+  scaleCalibrationFactor?: number
+  scaleLastReadAgeMs?: number
 }
 
 type SippoEventCommand = {
@@ -98,7 +107,32 @@ const sippoEventCommands: SippoEventCommand[] = [
     label: 'Reset day',
     path: '/api/event/reset',
   },
+  {
+    key: 'scaleTare',
+    label: 'Tare scale',
+    path: '/api/scale/tare',
+  },
 ]
+
+function formatWeight(value: number | undefined) {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return '—'
+  }
+
+  return `${value.toFixed(1)} g`
+}
+
+function formatAgeMs(value: number | undefined) {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return '—'
+  }
+
+  if (value < 1000) {
+    return `${Math.round(value)} ms`
+  }
+
+  return `${(value / 1000).toFixed(1)} s`
+}
 
 function getFallbackGifForMood(mood: SippoMood): SippoGifKey {
   if (mood === 'sleeping') {
@@ -291,7 +325,12 @@ function App() {
 
   const currentGifSrc = `${sippoGifPaths[currentGif]}?v=${gifVersion}`
 
+  const scaleReadyLabel = sippoState?.scaleReady ? 'ready' : 'not ready'
+  const scaleTaredLabel = sippoState?.scaleTared ? 'yes' : 'no'
+
   useEffect(() => {
+    refreshSippoStateSilently()
+
     const intervalId = window.setInterval(() => {
       refreshSippoStateSilently()
     }, STATE_POLL_INTERVAL_MS)
@@ -382,6 +421,36 @@ function App() {
                 {sippoState?.totalDrankMl ?? 0}/
                 {sippoState?.dailyGoalMl ?? 2000} ml
               </strong>
+            </div>
+
+            <div>
+              <span>Scale</span>
+              <strong>{scaleReadyLabel}</strong>
+            </div>
+
+            <div>
+              <span>Scale tared</span>
+              <strong>{scaleTaredLabel}</strong>
+            </div>
+
+            <div>
+              <span>Weight raw</span>
+              <strong>{formatWeight(sippoState?.weightGrams)}</strong>
+            </div>
+
+            <div>
+              <span>Weight smooth</span>
+              <strong>{formatWeight(sippoState?.smoothedWeightGrams)}</strong>
+            </div>
+
+            <div>
+              <span>Scale age</span>
+              <strong>{formatAgeMs(sippoState?.scaleLastReadAgeMs)}</strong>
+            </div>
+
+            <div>
+              <span>Scale factor</span>
+              <strong>{sippoState?.scaleCalibrationFactor ?? '—'}</strong>
             </div>
           </div>
         </section>
