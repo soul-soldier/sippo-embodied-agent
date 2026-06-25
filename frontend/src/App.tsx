@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import type { CSSProperties } from 'react'
 import './App.css'
 
 type SippoMood =
@@ -278,7 +279,16 @@ function App() {
     }
   }
 
-  const displayColor = sippoState?.colorHex || '#00C9CC'
+  const isEmptyBottleWarning = sippoState?.mood === 'empty'
+  const displayColor = isEmptyBottleWarning
+    ? '#FF3700'
+    : sippoState?.colorHex || '#00C9CC'
+
+  const sippoDisplayStyle = {
+    '--sippo-display-color': displayColor,
+    backgroundColor: displayColor,
+  } as CSSProperties
+
   const currentGifSrc = `${sippoGifPaths[currentGif]}?v=${gifVersion}`
 
   useEffect(() => {
@@ -327,10 +337,9 @@ function App() {
         </label>
 
         <section
-          className="sippo-display"
-          style={{
-            backgroundColor: displayColor,
-          }}
+          className={`sippo-display ${isEmptyBottleWarning ? 'sippo-display--empty-warning' : ''
+            }`}
+          style={sippoDisplayStyle}
         >
           <div className="sippo-screen">
             <img

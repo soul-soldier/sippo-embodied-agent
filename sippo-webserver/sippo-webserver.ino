@@ -1,4 +1,5 @@
 #include <WiFiNINA.h>
+#include <Adafruit_NeoPixel.h>
 #include "sippo-secrets.h"
 
 char ssid[] = SECRET_SSID;
@@ -7,9 +8,18 @@ char pass[] = SECRET_PASS;
 int status = WL_IDLE_STATUS;
 WiFiServer server(80);
 
-const int PIN_RED = 5;
-const int PIN_GREEN = 6;
-const int PIN_BLUE = 9;
+const int LED_RING_PIN = 3;
+const int LED_RING_PIXEL_COUNT = 16;
+
+// Keep brightness conservative for the first test.
+// You can increase this later, but full white at 16 pixels can draw a lot of current.
+const int LED_RING_BRIGHTNESS = 40;
+
+Adafruit_NeoPixel ledRing(
+  LED_RING_PIXEL_COUNT,
+  LED_RING_PIN,
+  NEO_GRB + NEO_KHZ800
+);
 
 // ------------------------------------------------------------
 // Sippo configuration
@@ -28,6 +38,13 @@ const unsigned long REMINDER_3_AFTER_MS = 90UL * 1000UL;
 const unsigned long HAPPY_ANIMATION_MS = 5000UL;
 const unsigned long REFILL_ANIMATION_MS = 4000UL;
 const unsigned long GOAL_ANIMATION_MS = 8000UL;
+
+// Bottle-low warning animation.
+// Non-blocking: uses millis(), so Wi-Fi/API requests still work while it pulses.
+const int EMPTY_WARNING_RED = 255;
+const int EMPTY_WARNING_GREEN = 55;
+const int EMPTY_WARNING_BLUE = 0;
+const unsigned long EMPTY_WARNING_PULSE_MS = 1000UL;
 
 // ------------------------------------------------------------
 // Sippo state machine types
@@ -85,10 +102,12 @@ SippoState sippo;
 void setup() {
   Serial.begin(9600);
 
-  pinMode(PIN_RED, OUTPUT);
-  pinMode(PIN_GREEN, OUTPUT);
-  pinMode(PIN_BLUE, OUTPUT);
+  ledRing.begin();
+  ledRing.setBrightness(LED_RING_BRIGHTNESS);
+  ledRing.clear();
+  ledRing.show();
 
+  testLedRing();
   setRGB(0, 0, 0);
   setupSippoState();
 
@@ -171,9 +190,57 @@ void connect_WiFi() {
 // ------------------------------------------------------------
 
 void setRGB(int redValue, int greenValue, int blueValue) {
-  analogWrite(PIN_RED, redValue);
-  analogWrite(PIN_GREEN, greenValue);
-  analogWrite(PIN_BLUE, blueValue);
+  // Compatibility wrapper:
+  // The rest of the Sippo code can keep using setRGB(r, g, b),
+  // but instead of driving three PWM pins, we now fill the whole NeoPixel ring.
+  ledRing.fill(ledRing.Color(redValue, greenValue, blueValue));
+  ledRing.show();
+}
+
+void testLedRing() {
+  // Startup test: one white pixel walks around the ring once.
+  for (int i = 0; i < LED_RING_PIXEL_COUNT; i++) {
+    ledRing.clear();
+    ledRing.setPixelColor(i, ledRing.Color(255, 255, 255));
+    ledRing.show();
+    delay(70);
+  }
+
+  // Then briefly show red, green, blue so you can spot wrong color order.
+  ledRing.fill(ledRing.Color(255, 0, 0));
+  ledRing.show();
+  delay(300);
+
+  ledRing.fill(ledRing.Color(0, 255, 0));
+  ledRing.show();
+  delay(300);
+
+  ledRing.fill(ledRing.Color(0, 0, 255));
+  ledRing.show();
+  delay(300);
+
+  ledRing.clear();
+  ledRing.show();
+}
+
+void applyEmptyBottleWarningOutput() {
+  unsigned long phase = millis() % EMPTY_WARNING_PULSE_MS;
+
+  // Triangle wave: dim -> bright -> dim.
+  // Minimum is not 0, so the warning feels like pulsing instead of disappearing.
+  int pulse;
+
+  if (phase < EMPTY_WARNING_PULSE_MS / 2) {
+    pulse = map(phase, 0, EMPTY_WARNING_PULSE_MS / 2, 35, 255);
+  } else {
+    pulse = map(phase, EMPTY_WARNING_PULSE_MS / 2, EMPTY_WARNING_PULSE_MS, 255, 35);
+  }
+
+  int red = (EMPTY_WARNING_RED * pulse) / 255;
+  int green = (EMPTY_WARNING_GREEN * pulse) / 255;
+  int blue = (EMPTY_WARNING_BLUE * pulse) / 255;
+
+  setRGB(red, green, blue);
 }
 
 void applyMoodOutput() {
@@ -211,7 +278,7 @@ void applyMoodOutput() {
       break;
 
     case MOOD_EMPTY:
-      setRGB(0, 119, 255);
+      applyEmptyBottleWarningOutput();
       break;
   }
 }
@@ -262,6 +329,14 @@ void updateSippoStateMachine() {
   // Temporary moods are used for short animations:
   // happy, refill reaction, goal celebration.
   if (now < sippo.temporaryMoodUntil) {
+    applyMoodOutput();
+    return;
+  }
+
+  // Empty / low bottle is not just a short reaction.
+  // Keep warning until a refill event resets bottleFillPercent.
+  if (sippo.bottleFillPercent <= 10) {
+    sippo.mood = MOOD_EMPTY;
     applyMoodOutput();
     return;
   }
@@ -321,7 +396,7 @@ void dispatchSippoEvent(SippoEvent event) {
       sippo.mode = MODE_AWAKE;
       sippo.bottleFillPercent = 5;
       sippo.mood = MOOD_EMPTY;
-      sippo.temporaryMoodUntil = now + REFILL_ANIMATION_MS;
+      sippo.temporaryMoodUntil = 0;
       break;
 
     case EV_SLEEP_MODE_STARTED:
@@ -445,7 +520,7 @@ const char* moodToHex(SippoMood mood) {
       return "#00C9CC";
 
     case MOOD_EMPTY:
-      return "#0077FF";
+      return "#FF3700";
 
     default:
       return "#00C9CC";
