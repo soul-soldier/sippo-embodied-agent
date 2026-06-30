@@ -48,6 +48,47 @@ const int SCALE_READINGS_PER_SAMPLE = 3;
 // 0.0 = no movement, 1.0 = no smoothing.
 const float SCALE_SMOOTHING_ALPHA = 0.25;
 
+// ------------------------------------------------------------
+// Real bottle / sip detection configuration
+// ------------------------------------------------------------
+
+// Your measured empty bottle weight.
+// This is the bottle without water, but including the physical bottle itself.
+const float EMPTY_BOTTLE_WEIGHT_GRAMS = 341.0;
+
+// TODO: Replace this with the measured water capacity of your bottle.
+// Fill the bottle to the level you consider "full", place it on the scale,
+// then calculate: fullWeight - EMPTY_BOTTLE_WEIGHT_GRAMS.
+// Because 1 g water is approximately 1 ml, this is also the capacity in ml.
+const int BOTTLE_CAPACITY_ML = 750;
+
+// Below this gross weight we assume the bottle is not currently on the scale.
+// This prevents a bottle lift from being counted as a huge sip.
+const float BOTTLE_PRESENT_MIN_WEIGHT_GRAMS = 180.0;
+
+// The bottle must be back on the platform and stable for this long before
+// we allow low/empty warnings. This prevents a lift from looking like empty.
+const unsigned long BOTTLE_PRESENT_STABLE_FOR_EMPTY_MS = 3000UL;
+
+// Sip detection: after the bottle is lifted and placed back, a lower weight
+// means water was consumed. Values are grams ~= ml.
+const float SIP_DETECTION_MIN_DROP_GRAMS = 50.0;
+const float SIP_DETECTION_MAX_DROP_GRAMS = 750.0;
+
+// Refill detection: after the bottle is lifted and placed back, a higher weight
+// by this amount means refill.
+const float REFILL_DETECTION_MIN_RISE_GRAMS = 250.0;
+
+// Trigger the empty/low warning when estimated remaining water is below this.
+const float EMPTY_BOTTLE_WARNING_WATER_ML = 60.0;
+
+// Wait after the bottle returns before comparing weights.
+// This avoids counting mechanical wobble while the platform settles.
+const unsigned long BOTTLE_RETURN_SETTLE_MS = 3000UL;
+
+// Avoid duplicate events from the same physical action.
+const unsigned long SCALE_EVENT_COOLDOWN_MS = 3000UL;
+
 HX711 scale;
 
 bool scaleReady = false;
@@ -59,11 +100,42 @@ bool smoothedWeightInitialized = false;
 
 unsigned long lastScaleReadAt = 0;
 
+// Scale-derived bottle state.
+bool scaleAutoEventsEnabled = true;
+bool bottlePresent = false;
+bool previousBottlePresent = false;
+bool pendingBottleReturnEvaluation = false;
+bool lastKnownBottleWeightInitialized = false;
+
+float estimatedWaterMl = 0.0;
+int estimatedBottleFillPercent = 0;
+float lastKnownBottleWeightGrams = 0.0;
+float weightBeforeBottleLiftGrams = 0.0;
+float scaleDeltaSinceLastBottleWeightGrams = 0.0;
+
+unsigned long bottleReturnedAt = 0;
+unsigned long bottlePresentSinceAt = 0;
+unsigned long bottleAbsentSinceAt = 0;
+unsigned long lastScaleEventAt = 0;
+
+unsigned long scaleEventCounter = 0;
+bool wizardEmptyOverride = false;
+
+const char* lastScaleEventName = "none";
+
 // Forward declarations for scale helper overloads.
 void setupScale();
 void updateScaleReading();
 void updateScaleReading(bool forceRead);
 void tareScale();
+void updateBottleEstimateFromScale();
+void resetScaleEventTracking();
+void acceptCurrentBottleWeightAsBaseline();
+bool canShowEmptyWarningNow(unsigned long now);
+void setScaleEvent(const char* eventName);
+void applySipDetected(int amountMl);
+void applyRefillDetected();
+void applyEmptyDetected();
 
 // ------------------------------------------------------------
 // Sippo configuration
@@ -170,13 +242,12 @@ void setup() {
 }
 
 void loop() {
-  // Later, real sensor adapters will be called here.
-  // pollSensorAdapters();
-
-  // For now the scale is read-only and only exposed through /api/state.
-  // Automatic Sippo events from the scale will be added after we observe
-  // stable real-world bottle/full/sip/refill values.
   updateScaleReading();
+  updateBottleEstimateFromScale();
+
+  // Real scale events live here now. The Wizard-of-Oz HTTP buttons still
+  // call dispatchSippoEvent(...) directly and remain available as fallback.
+  pollSensorAdapters();
 
   updateSippoStateMachine();
 
@@ -224,6 +295,8 @@ void setupScale() {
   lastScaleReadAt = 0;
 
   updateScaleReading(true);
+  updateBottleEstimateFromScale();
+  resetScaleEventTracking();
 
   Serial.println(F("Scale tare complete."));
 }
@@ -285,8 +358,121 @@ void tareScale() {
   lastScaleReadAt = 0;
 
   updateScaleReading(true);
+  updateBottleEstimateFromScale();
+  resetScaleEventTracking();
 
   Serial.println(F("Manual scale tare complete."));
+}
+
+void updateBottleEstimateFromScale() {
+  if (!scaleReady || !scaleTared || !smoothedWeightInitialized) {
+    return;
+  }
+
+  // Use the latest raw-ish calibrated reading for presence detection.
+  // The smoothed value lags behind during a lift, which can otherwise make a
+  // removed bottle look like a very low/empty bottle for a moment.
+  bottlePresent = lastWeightGrams >= BOTTLE_PRESENT_MIN_WEIGHT_GRAMS;
+
+  if (!bottlePresent) {
+    // Bottle is probably lifted/removed.
+    // IMPORTANT: keep the last known water/fill values instead of forcing 0.
+    // Otherwise every normal sip lift would briefly look like an empty bottle.
+    return;
+  }
+
+  float currentGrossWeightGrams = smoothedWeightGrams;
+  float waterMl = currentGrossWeightGrams - EMPTY_BOTTLE_WEIGHT_GRAMS;
+
+  if (waterMl < 0.0) {
+    waterMl = 0.0;
+  }
+
+  if (waterMl > BOTTLE_CAPACITY_ML) {
+    waterMl = BOTTLE_CAPACITY_ML;
+  }
+
+  estimatedWaterMl = waterMl;
+  estimatedBottleFillPercent = constrain(
+    (int)((estimatedWaterMl * 100.0 / BOTTLE_CAPACITY_ML) + 0.5),
+    0,
+    100
+  );
+
+  // The physical scale is now the best source for bottle fill,
+  // but only while the bottle is actually present.
+  sippo.bottleFillPercent = estimatedBottleFillPercent;
+}
+
+void resetScaleEventTracking() {
+  previousBottlePresent = bottlePresent;
+  pendingBottleReturnEvaluation = false;
+  lastKnownBottleWeightInitialized = false;
+  lastKnownBottleWeightGrams = 0.0;
+  weightBeforeBottleLiftGrams = 0.0;
+  scaleDeltaSinceLastBottleWeightGrams = 0.0;
+  bottleReturnedAt = 0;
+  bottlePresentSinceAt = bottlePresent ? millis() : 0;
+  bottleAbsentSinceAt = bottlePresent ? 0 : millis();
+  lastScaleEventAt = 0;
+  wizardEmptyOverride = false;
+  setScaleEvent("scale_reset");
+
+  if (bottlePresent) {
+    acceptCurrentBottleWeightAsBaseline();
+  }
+}
+
+void acceptCurrentBottleWeightAsBaseline() {
+  if (!bottlePresent || !smoothedWeightInitialized) {
+    return;
+  }
+
+  lastKnownBottleWeightGrams = smoothedWeightGrams;
+  lastKnownBottleWeightInitialized = true;
+  scaleDeltaSinceLastBottleWeightGrams = 0.0;
+}
+
+bool canShowEmptyWarningNow(unsigned long now) {
+  if (wizardEmptyOverride) {
+    return true;
+  }
+
+  // Without a reliable scale, fall back to the old behavior.
+  if (!scaleAutoEventsEnabled || !scaleReady || !scaleTared) {
+    return true;
+  }
+
+  // With scale auto detection enabled, "empty" only makes sense while the
+  // bottle is actually on the platform. A lifted bottle must never look empty.
+  if (!bottlePresent) {
+    return false;
+  }
+
+  // Important: after the bottle returns, there is a settle/evaluation window.
+  // During that window we may already know the bottle is low, but we still have
+  // not decided whether this action was a sip or a refill. Do not show the
+  // empty warning before the sip reward has had a chance to start.
+  if (pendingBottleReturnEvaluation) {
+    return false;
+  }
+
+  // Also require the bottle to sit stably for a short moment. This avoids the
+  // UI flickering into the empty warning while the platform is still wobbling.
+  if (bottlePresentSinceAt == 0) {
+    return false;
+  }
+
+  if (now - bottlePresentSinceAt < BOTTLE_PRESENT_STABLE_FOR_EMPTY_MS) {
+    return false;
+  }
+
+  return true;
+}
+
+void setScaleEvent(const char* eventName) {
+  lastScaleEventName = eventName;
+  scaleEventCounter++;
 }
 
 // ------------------------------------------------------------
@@ -441,6 +627,8 @@ void applyMoodOutput() {
 // ------------------------------------------------------------
 
 void setupSippoState() {
+  wizardEmptyOverride = false;
+
   sippo.mode = MODE_AWAKE;
   sippo.mood = MOOD_CONTENT;
 
@@ -487,8 +675,12 @@ void updateSippoStateMachine() {
   }
 
   // Empty / low bottle is not just a short reaction.
-  // Keep warning until a refill event resets bottleFillPercent.
-  if (sippo.bottleFillPercent <= 10) {
+  // With scale auto detection active, only show this after the bottle is back
+  // on the platform and the sip/refill comparison window has finished.
+  // Otherwise the UI can show "empty" before the sip reward.
+  bool canShowEmptyWarning = canShowEmptyWarningNow(now);
+
+  if (sippo.bottleFillPercent <= 10 && canShowEmptyWarning) {
     sippo.mood = MOOD_EMPTY;
     applyMoodOutput();
     return;
@@ -516,40 +708,83 @@ void updateSippoStateMachine() {
   applyMoodOutput();
 }
 
+
+void applySipDetected(int amountMl) {
+  unsigned long now = millis();
+
+  if (amountMl <= 0) {
+    amountMl = SIP_AMOUNT_ML;
+  }
+
+  sippo.mode = MODE_AWAKE;
+  wizardEmptyOverride = false;
+  sippo.lastSipAt = now;
+  sippo.reminderLevel = 0;
+
+  sippo.totalDrankMl += amountMl;
+
+  if (bottlePresent && smoothedWeightInitialized) {
+    sippo.bottleFillPercent = estimatedBottleFillPercent;
+  } else {
+    int fillDropPercent = max(1, (int)((long)amountMl * 100L / BOTTLE_CAPACITY_ML));
+    sippo.bottleFillPercent = max(0, sippo.bottleFillPercent - fillDropPercent);
+  }
+
+  if (sippo.totalDrankMl >= DAILY_GOAL_ML) {
+    sippo.goalReached = true;
+    sippo.mood = MOOD_GOAL;
+    sippo.temporaryMoodUntil = now + GOAL_ANIMATION_MS;
+  } else {
+    sippo.mood = MOOD_HAPPY;
+    sippo.temporaryMoodUntil = now + HAPPY_ANIMATION_MS;
+  }
+}
+
+void applyRefillDetected() {
+  unsigned long now = millis();
+
+  sippo.mode = MODE_AWAKE;
+  wizardEmptyOverride = false;
+
+  if (bottlePresent && smoothedWeightInitialized) {
+    sippo.bottleFillPercent = estimatedBottleFillPercent;
+  } else {
+    sippo.bottleFillPercent = 100;
+  }
+
+  sippo.mood = MOOD_REFILL;
+  sippo.temporaryMoodUntil = now + REFILL_ANIMATION_MS;
+}
+
+void applyEmptyDetected() {
+  sippo.mode = MODE_AWAKE;
+  sippo.bottleFillPercent = min(sippo.bottleFillPercent, 5);
+  sippo.mood = MOOD_EMPTY;
+  sippo.temporaryMoodUntil = 0;
+}
+
 void dispatchSippoEvent(SippoEvent event) {
   unsigned long now = millis();
 
   switch (event) {
     case EV_SIP_DETECTED:
-      sippo.mode = MODE_AWAKE;
-      sippo.lastSipAt = now;
-      sippo.reminderLevel = 0;
-
-      sippo.totalDrankMl += SIP_AMOUNT_ML;
-      sippo.bottleFillPercent = max(0, sippo.bottleFillPercent - 8);
-
-      if (sippo.totalDrankMl >= DAILY_GOAL_ML) {
-        sippo.goalReached = true;
-        sippo.mood = MOOD_GOAL;
-        sippo.temporaryMoodUntil = now + GOAL_ANIMATION_MS;
-      } else {
-        sippo.mood = MOOD_HAPPY;
-        sippo.temporaryMoodUntil = now + HAPPY_ANIMATION_MS;
-      }
+      // Wizard-of-Oz fallback: fixed sip amount.
+      applySipDetected(SIP_AMOUNT_ML);
+      setScaleEvent("wizard_sip");
       break;
 
     case EV_REFILL_DETECTED:
-      sippo.mode = MODE_AWAKE;
-      sippo.bottleFillPercent = 100;
-      sippo.mood = MOOD_REFILL;
-      sippo.temporaryMoodUntil = now + REFILL_ANIMATION_MS;
+      // Manual refill button is intentionally visual-only in the frontend.
+      // The scale remains the source of truth for bottle weight/fill.
+      // Keep this backend route as a safe no-op for older frontends.
+      setScaleEvent("wizard_refill_visual_only");
       break;
 
     case EV_BOTTLE_EMPTY_OR_LOW:
-      sippo.mode = MODE_AWAKE;
-      sippo.bottleFillPercent = 5;
-      sippo.mood = MOOD_EMPTY;
-      sippo.temporaryMoodUntil = 0;
+      // Manual empty/low button is intentionally visual-only in the frontend.
+      // Do NOT change bottleFillPercent here; otherwise lifting the bottle or
+      // demo-clicking this button would corrupt the scale-owned bottle state.
+      setScaleEvent("wizard_empty_visual_only");
       break;
 
     case EV_SLEEP_MODE_STARTED:
@@ -708,6 +943,9 @@ void sendNotFound(WiFiClient& client) {
 void sendStateJson(WiFiClient& client, const char* message) {
   sendCorsHeaders(client);
 
+  updateScaleReading();
+  updateBottleEstimateFromScale();
+
   int goalPercent = min(
     100,
     (int)((long)sippo.totalDrankMl * 100L / DAILY_GOAL_ML)
@@ -749,8 +987,6 @@ void sendStateJson(WiFiClient& client, const char* message) {
   client.print(F(",\"goalReached\":"));
   client.print(sippo.goalReached ? F("true") : F("false"));
 
-  updateScaleReading();
-
   client.print(F(",\"scaleReady\":"));
   client.print(scaleReady ? F("true") : F("false"));
 
@@ -768,6 +1004,40 @@ void sendStateJson(WiFiClient& client, const char* message) {
 
   client.print(F(",\"scaleLastReadAgeMs\":"));
   client.print(lastScaleReadAt == 0 ? 0 : millis() - lastScaleReadAt);
+
+  client.print(F(",\"scaleAutoEventsEnabled\":"));
+  client.print(scaleAutoEventsEnabled ? F("true") : F("false"));
+
+  client.print(F(",\"bottlePresent\":"));
+  client.print(bottlePresent ? F("true") : F("false"));
+
+  client.print(F(",\"estimatedWaterMl\":"));
+  client.print(estimatedWaterMl, 1);
+
+  client.print(F(",\"estimatedBottleFillPercent\":"));
+  client.print(estimatedBottleFillPercent);
+
+  client.print(F(",\"emptyBottleWeightGrams\":"));
+  client.print(EMPTY_BOTTLE_WEIGHT_GRAMS, 1);
+
+  client.print(F(",\"bottleCapacityMl\":"));
+  client.print(BOTTLE_CAPACITY_ML);
+
+  client.print(F(",\"lastKnownBottleWeightGrams\":"));
+  client.print(lastKnownBottleWeightGrams, 1);
+
+  client.print(F(",\"scaleDeltaSinceLastBottleWeightGrams\":"));
+  client.print(scaleDeltaSinceLastBottleWeightGrams, 1);
+
+  client.print(F(",\"scaleEventCounter\":"));
+  client.print(scaleEventCounter);
+
+  client.print(F(",\"lastScaleEvent\":\""));
+  client.print(lastScaleEventName);
+  client.print(F("\""));
+
+  client.print(F(",\"emptyWarningEligible\":"));
+  client.print(canShowEmptyWarningNow(millis()) ? F("true") : F("false"));
 
   client.println(F("}"));
 }
@@ -818,6 +1088,32 @@ void handleClient(WiFiClient& client) {
     }
   }
 
+  else if (requestLine.startsWith("GET /api/scale/auto/on")) {
+    scaleAutoEventsEnabled = true;
+    wizardEmptyOverride = false;
+    setScaleEvent("scale_auto_on");
+    if (bottlePresent) {
+      acceptCurrentBottleWeightAsBaseline();
+    }
+    sendStateJson(client, "Scale auto detection enabled");
+  }
+
+  else if (requestLine.startsWith("GET /api/scale/auto/off")) {
+    scaleAutoEventsEnabled = false;
+    pendingBottleReturnEvaluation = false;
+    setScaleEvent("scale_auto_off");
+    sendStateJson(client, "Scale auto detection disabled");
+  }
+
+  else if (requestLine.startsWith("GET /api/scale/baseline")) {
+    wizardEmptyOverride = false;
+    updateScaleReading(true);
+    updateBottleEstimateFromScale();
+    acceptCurrentBottleWeightAsBaseline();
+    setScaleEvent("baseline_set");
+    sendStateJson(client, "Current bottle weight accepted as baseline");
+  }
+
   else if (requestLine.startsWith("GET /api/event/sip")) {
     dispatchSippoEvent(EV_SIP_DETECTED);
     sendStateJson(client, "Sip detected");
@@ -825,12 +1121,12 @@ void handleClient(WiFiClient& client) {
 
   else if (requestLine.startsWith("GET /api/event/refill")) {
     dispatchSippoEvent(EV_REFILL_DETECTED);
-    sendStateJson(client, "Refill detected");
+    sendStateJson(client, "Refill button is visual-only; scale keeps bottle state");
   }
 
   else if (requestLine.startsWith("GET /api/event/empty")) {
     dispatchSippoEvent(EV_BOTTLE_EMPTY_OR_LOW);
-    sendStateJson(client, "Bottle empty or low");
+    sendStateJson(client, "Empty button is visual-only; scale keeps bottle state");
   }
 
   else if (requestLine.startsWith("GET /api/event/sleep")) {
@@ -881,33 +1177,163 @@ void handleClient(WiFiClient& client) {
 // ------------------------------------------------------------
 
 void pollSensorAdapters() {
-  // Later, real hardware detection should call the same event dispatcher
-  // that the current Wizard-of-Oz web buttons use.
-  //
-  // The HX711 scale is already read in updateScaleReading(), but for now
-  // it is intentionally read-only. After collecting stable values for:
-  // - empty platform
-  // - empty bottle
-  // - full bottle
-  // - one sip
-  // - refill
-  // we can compare smoothedWeightGrams against thresholds here.
+  if (!scaleAutoEventsEnabled) {
+    return;
+  }
 
-  // Example:
-  //
-  // if (detectSipFromWeightAndTilt()) {
-  //   dispatchSippoEvent(EV_SIP_DETECTED);
-  // }
-  //
-  // if (detectRefillAfterBottleLift()) {
-  //   dispatchSippoEvent(EV_REFILL_DETECTED);
-  // }
-  //
-  // if (detectLongPress()) {
-  //   dispatchSippoEvent(EV_SLEEP_MODE_STARTED);
-  // }
-  //
-  // if (detectShakeWhileSleeping()) {
-  //   dispatchSippoEvent(EV_SLEEP_MODE_ENDED);
-  // }
+  if (!scaleReady || !scaleTared || !smoothedWeightInitialized) {
+    return;
+  }
+
+  if (sippo.mode == MODE_SLEEPING) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // Use the non-smoothed current reading for "is the bottle on the platform?"
+  // This makes lift/remove transitions much faster and avoids the smoothed value
+  // slowly falling through "almost empty" while the bottle is already gone.
+  bool currentBottlePresent = lastWeightGrams >= BOTTLE_PRESENT_MIN_WEIGHT_GRAMS;
+  bottlePresent = currentBottlePresent;
+
+  // Detect lift / return transitions first. A sip usually looks like:
+  // bottle present -> bottle lifted away -> bottle placed back with lower weight.
+  if (currentBottlePresent != previousBottlePresent) {
+    if (!currentBottlePresent) {
+      bottleAbsentSinceAt = now;
+      bottlePresentSinceAt = 0;
+
+      if (lastKnownBottleWeightInitialized) {
+        weightBeforeBottleLiftGrams = lastKnownBottleWeightGrams;
+      }
+
+      pendingBottleReturnEvaluation = false;
+      wizardEmptyOverride = false;
+      setScaleEvent("bottle_lifted");
+    } else {
+      bottlePresentSinceAt = now;
+      bottleAbsentSinceAt = 0;
+
+      // The smoothing value still contains readings from while the bottle was
+      // missing. Reset it to the current reading so the return comparison does
+      // not look like a fake refill/sip because of smoothing lag.
+      smoothedWeightGrams = lastWeightGrams;
+      smoothedWeightInitialized = true;
+      updateBottleEstimateFromScale();
+
+      bottleReturnedAt = now;
+      pendingBottleReturnEvaluation = true;
+      setScaleEvent("bottle_returned_waiting");
+    }
+
+    previousBottlePresent = currentBottlePresent;
+    return;
+  }
+
+  if (!currentBottlePresent) {
+    // Bottle is not on the platform. Do not detect sip/refill/empty now.
+    return;
+  }
+
+  if (!lastKnownBottleWeightInitialized) {
+    // First time a bottle appears after startup/tare: treat it as the
+    // baseline, not as a refill.
+    pendingBottleReturnEvaluation = false;
+    acceptCurrentBottleWeightAsBaseline();
+    weightBeforeBottleLiftGrams = lastKnownBottleWeightGrams;
+    bottlePresentSinceAt = now;
+    setScaleEvent("baseline_initialized");
+    return;
+  }
+
+  if (pendingBottleReturnEvaluation) {
+    if (now - bottleReturnedAt < BOTTLE_RETURN_SETTLE_MS) {
+      return;
+    }
+
+    pendingBottleReturnEvaluation = false;
+
+    // Force one fresh sample after the settle time, then compare against the
+    // stable weight from before the bottle was lifted.
+    updateScaleReading(true);
+    smoothedWeightGrams = lastWeightGrams;
+    updateBottleEstimateFromScale();
+
+    float currentWeightGrams = smoothedWeightGrams;
+    float deltaGrams = currentWeightGrams - weightBeforeBottleLiftGrams;
+    scaleDeltaSinceLastBottleWeightGrams = deltaGrams;
+
+    if (now - lastScaleEventAt < SCALE_EVENT_COOLDOWN_MS) {
+      acceptCurrentBottleWeightAsBaseline();
+      setScaleEvent("ignored_cooldown");
+      return;
+    }
+
+    if (deltaGrams <= -SIP_DETECTION_MIN_DROP_GRAMS && deltaGrams >= -SIP_DETECTION_MAX_DROP_GRAMS) {
+      int sipAmountMl = (int)((-deltaGrams) + 0.5);
+
+      Serial.print(F("Scale sip detected, ml: "));
+      Serial.println(sipAmountMl);
+
+      wizardEmptyOverride = false;
+      applySipDetected(sipAmountMl);
+      acceptCurrentBottleWeightAsBaseline();
+      lastScaleEventAt = now;
+      setScaleEvent("scale_sip");
+      applyMoodOutput();
+      return;
+    }
+
+    if (deltaGrams >= REFILL_DETECTION_MIN_RISE_GRAMS) {
+      Serial.print(F("Scale refill detected, rise g: "));
+      Serial.println(deltaGrams, 1);
+
+      wizardEmptyOverride = false;
+      applyRefillDetected();
+      acceptCurrentBottleWeightAsBaseline();
+      lastScaleEventAt = now;
+      setScaleEvent("scale_refill");
+      applyMoodOutput();
+      return;
+    }
+
+    // Bottle was lifted but came back with nearly the same weight.
+    acceptCurrentBottleWeightAsBaseline();
+    setScaleEvent("bottle_returned_no_change");
+    return;
+  }
+
+  // Keep the baseline from drifting too far due to tiny noise, but do not follow
+  // real sip-sized changes. This keeps long idle periods stable.
+  float directDeltaGrams = smoothedWeightGrams - lastKnownBottleWeightGrams;
+  scaleDeltaSinceLastBottleWeightGrams = directDeltaGrams;
+
+  if (directDeltaGrams > -5.0 && directDeltaGrams < 5.0) {
+    lastKnownBottleWeightGrams = smoothedWeightGrams;
+  }
+
+  // Only show the low/empty warning when the bottle is actually sitting on the
+  // platform and has been stable there for a moment. This prevents every lift
+  // from becoming an empty-bottle warning.
+  bool bottleStableForEmptyWarning = canShowEmptyWarningNow(now);
+
+  // If the sip that just happened made the bottle low/empty, do not interrupt
+  // the reward animation. The state machine already keeps temporary moods
+  // such as HAPPY/GOAL visible until temporaryMoodUntil. Only after that
+  // window is over may the scale switch to the empty-bottle warning.
+  bool rewardOrReactionStillPlaying = now < sippo.temporaryMoodUntil;
+
+  if (
+    bottleStableForEmptyWarning &&
+    !pendingBottleReturnEvaluation &&
+    !rewardOrReactionStillPlaying &&
+    estimatedWaterMl <= EMPTY_BOTTLE_WARNING_WATER_ML &&
+    sippo.mood != MOOD_EMPTY
+  ) {
+    wizardEmptyOverride = false;
+    applyEmptyDetected();
+    setScaleEvent("scale_empty");
+    applyMoodOutput();
+  }
 }
