@@ -3,8 +3,26 @@
 #include "HX711.h"
 #include "sippo-secrets.h"
 
-char ssid[] = SECRET_SSID;
-char pass[] = SECRET_PASS;
+// ------------------------------------------------------------
+// Wi-Fi mode
+// ------------------------------------------------------------
+//
+// true  = demo mode: Sippo creates its own Wi-Fi access point.
+//         Connect your laptop/phone to SIPPO_BOTTLE and use:
+//         http://192.168.4.1
+//
+// false = normal mode: Sippo joins an existing Wi-Fi network from
+//         sippo-secrets.h and gets an IP from that router.
+const bool USE_AP_MODE = false;
+
+// Access Point credentials.
+// Important: WiFiNINA AP SSID and password should both be at least 8 chars.
+char apSsid[] = "SIPPO_BOTTLE";
+char apPass[] = "sippo2026";
+
+// Existing router Wi-Fi fallback.
+char stationSsid[] = SECRET_SSID;
+char stationPass[] = SECRET_PASS;
 
 int status = WL_IDLE_STATUS;
 WiFiServer server(80);
@@ -30,17 +48,12 @@ Adafruit_NeoPixel ledRing(
 const int HX711_DT_PIN = 4;
 const int HX711_SCK_PIN = 5;
 
-// Calibrated with the 341 g bottle:
-// raw-ish value around 143548 / 341 g = ~421
+// Calibrated with the 341 g bottle: 143548 / 341 g = ~421
 const float SCALE_CALIBRATION_FACTOR = 421.0;
-
-// Read the scale periodically, not on every loop iteration.
-// This keeps the webserver responsive.
 const unsigned long SCALE_READ_INTERVAL_MS = 300UL;
 const unsigned long SCALE_STARTUP_WAIT_MS = 5000UL;
 const int SCALE_READINGS_PER_SAMPLE = 3;
 
-// Exponential smoothing for display/debug output.
 // 0.0 = no movement, 1.0 = no smoothing.
 const float SCALE_SMOOTHING_ALPHA = 0.25;
 
@@ -48,49 +61,17 @@ const float SCALE_SMOOTHING_ALPHA = 0.25;
 // Real bottle / sip detection configuration
 // ------------------------------------------------------------
 
-// Your measured empty bottle weight.
-// This is the bottle without water, but including the physical bottle itself.
 const float EMPTY_BOTTLE_WEIGHT_GRAMS = 341.0;
-
-// TODO: Replace this with the measured water capacity of your bottle.
-// Fill the bottle to the level you consider "full", place it on the scale,
-// then calculate: fullWeight - EMPTY_BOTTLE_WEIGHT_GRAMS.
-// Because 1 g water is approximately 1 ml, this is also the capacity in ml.
 const int BOTTLE_CAPACITY_ML = 750;
-
-// Below this gross weight we assume the bottle is not currently on the scale.
-// This prevents a bottle lift from being counted as a huge sip.
 const float BOTTLE_PRESENT_MIN_WEIGHT_GRAMS = 180.0;
-
-// The bottle must be back on the platform and stable for this long before
-// we allow low/empty warnings. This prevents a lift from looking like empty.
 const unsigned long BOTTLE_PRESENT_STABLE_FOR_EMPTY_MS = 2500UL;
-
-// Sip detection: after the bottle is lifted and placed back, a lower weight
-// means water was consumed. Values are grams ~= ml.
 const float SIP_DETECTION_MIN_DROP_GRAMS = 50.0;
 const float SIP_DETECTION_MAX_DROP_GRAMS = 750.0;
-
-// Refill detection: after the bottle is lifted and placed back, a higher weight
-// by this amount means refill.
 const float REFILL_DETECTION_MIN_RISE_GRAMS = 250.0;
-
-// Trigger the empty/low warning when estimated remaining water is below this.
 const float EMPTY_BOTTLE_WARNING_WATER_ML = 60.0;
-
-// Wait after the bottle returns before committing a sip/refill.
-// This avoids counting mechanical wobble while the platform settles.
-// The UI can still get an early, non-committing sip candidate before this ends.
 const unsigned long BOTTLE_RETURN_SETTLE_MS = 1500UL;
-
-// After the bottle returns, wait only a short moment, then do one quick
-// non-committing check. If the weight is clearly lower, the frontend may show
-// the happy reaction immediately, while the Arduino still waits until
-// BOTTLE_RETURN_SETTLE_MS before updating totalDrankMl.
 const unsigned long EARLY_SIP_FEEDBACK_AFTER_RETURN_MS = 350UL;
 const float EARLY_SIP_FEEDBACK_MIN_DROP_GRAMS = 35.0;
-
-// Avoid duplicate events from the same physical action.
 const unsigned long SCALE_EVENT_COOLDOWN_MS = 3000UL;
 
 HX711 scale;
@@ -104,7 +85,6 @@ bool smoothedWeightInitialized = false;
 
 unsigned long lastScaleReadAt = 0;
 
-// Scale-derived bottle state.
 bool scaleAutoEventsEnabled = true;
 bool bottlePresent = false;
 bool previousBottlePresent = false;
@@ -128,7 +108,7 @@ bool wizardEmptyOverride = false;
 
 const char* lastScaleEventName = "none";
 
-// Forward declarations for scale helper overloads.
+// Forward declarations
 void setupScale();
 void updateScaleReading();
 void updateScaleReading(bool forceRead);
@@ -149,9 +129,7 @@ void applyEmptyDetected();
 const int DAILY_GOAL_ML = 2000;
 const int SIP_AMOUNT_ML = 500;
 
-// Demo timings.
-// For the Wizard-of-Oz prototype these are intentionally short.
-// Later you can replace them with realistic values, e.g. 30/60/90 minutes.
+// Demo timings
 const unsigned long REMINDER_1_AFTER_MS = 30UL * 1000UL;
 const unsigned long REMINDER_2_AFTER_MS = 60UL * 1000UL;
 const unsigned long REMINDER_3_AFTER_MS = 90UL * 1000UL;
@@ -232,8 +210,12 @@ void setup() {
   setRGB(0, 0, 0);
   setupSippoState();
 
-  while (!Serial)
+  // Do not block forever waiting for the Serial Monitor.
+  // In AP demo mode Sippo should start even when the Serial Monitor is closed.
+  unsigned long serialWaitStartedAt = millis();
+  while (!Serial && millis() - serialWaitStartedAt < 1500) {
     ;
+  }
 
   setupScale();
 
@@ -484,10 +466,26 @@ void setScaleEvent(const char* eventName) {
 // ------------------------------------------------------------
 
 void printWifiStatus() {
+  IPAddress ip = WiFi.localIP();
+
+  if (USE_AP_MODE) {
+    Serial.println(F("Wi-Fi mode: Access Point"));
+    Serial.print(F("AP SSID: "));
+    Serial.println(apSsid);
+    Serial.print(F("AP password: "));
+    Serial.println(apPass);
+    Serial.print(F("AP IP Address: "));
+    Serial.println(ip);
+    Serial.println(F("Connect your laptop/phone to the Sippo Wi-Fi network."));
+    Serial.print(F("Use this Arduino backend URL in the frontend: http://"));
+    Serial.println(ip);
+    return;
+  }
+
+  Serial.println(F("Wi-Fi mode: Station / existing Wi-Fi"));
   Serial.print(F("SSID: "));
   Serial.println(WiFi.SSID());
 
-  IPAddress ip = WiFi.localIP();
   Serial.print(F("IP Address: "));
   Serial.println(ip);
 
@@ -496,7 +494,7 @@ void printWifiStatus() {
   Serial.print(rssi);
   Serial.println(F(" dBm"));
 
-  Serial.print(F("To see this page in action, open a browser to http://"));
+  Serial.print(F("Use this Arduino backend URL in the frontend: http://"));
   Serial.println(ip);
 }
 
@@ -515,16 +513,49 @@ void enable_WiFi() {
   }
 }
 
-void connect_WiFi() {
+void startAccessPointMode() {
+  Serial.print(F("Creating Sippo access point: "));
+  Serial.println(apSsid);
+
+  // Optional fixed AP IP.
+  // WiFiNINA normally uses 192.168.4.1 for AP mode, but setting it here
+  // makes the intended demo URL explicit.
+  IPAddress apIp(192, 168, 4, 1);
+  WiFi.config(apIp);
+
+  status = WiFi.beginAP(apSsid, apPass);
+
+  if (status != WL_AP_LISTENING) {
+    Serial.println(F("Creating access point failed."));
+    Serial.println(F("Check that the AP SSID/password are at least 8 characters."));
+    while (true)
+      ;
+  }
+
+  // Give the AP a moment to become visible to phones/laptops.
+  delay(3000);
+
+  Serial.println(F("Access point created."));
+}
+
+void connectStationMode() {
   WiFi.setHostname("sippo");
 
   while (status != WL_CONNECTED) {
     Serial.print(F("Attempting to connect to SSID: "));
-    Serial.println(ssid);
+    Serial.println(stationSsid);
 
-    status = WiFi.begin(ssid, pass);
+    status = WiFi.begin(stationSsid, stationPass);
 
     delay(10000);
+  }
+}
+
+void connect_WiFi() {
+  if (USE_AP_MODE) {
+    startAccessPointMode();
+  } else {
+    connectStationMode();
   }
 }
 
