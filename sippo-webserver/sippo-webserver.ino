@@ -11,16 +11,12 @@ WiFiServer server(80);
 
 const int LED_RING_PIN = 3;
 const int LED_RING_PIXEL_COUNT = 16;
-
-// Keep brightness conservative for the first test.
-// You can increase this later, but full white at 16 pixels can draw a lot of current.
-const int LED_RING_BRIGHTNESS = 40;
+const int LED_RING_BRIGHTNESS = 50;
 
 Adafruit_NeoPixel ledRing(
   LED_RING_PIXEL_COUNT,
   LED_RING_PIN,
-  NEO_GRB + NEO_KHZ800
-);
+  NEO_GRB + NEO_KHZ800);
 
 // ------------------------------------------------------------
 // Scale / HX711 configuration
@@ -40,7 +36,7 @@ const float SCALE_CALIBRATION_FACTOR = 421.0;
 
 // Read the scale periodically, not on every loop iteration.
 // This keeps the webserver responsive.
-const unsigned long SCALE_READ_INTERVAL_MS = 500UL;
+const unsigned long SCALE_READ_INTERVAL_MS = 300UL;
 const unsigned long SCALE_STARTUP_WAIT_MS = 5000UL;
 const int SCALE_READINGS_PER_SAMPLE = 3;
 
@@ -68,7 +64,7 @@ const float BOTTLE_PRESENT_MIN_WEIGHT_GRAMS = 180.0;
 
 // The bottle must be back on the platform and stable for this long before
 // we allow low/empty warnings. This prevents a lift from looking like empty.
-const unsigned long BOTTLE_PRESENT_STABLE_FOR_EMPTY_MS = 3000UL;
+const unsigned long BOTTLE_PRESENT_STABLE_FOR_EMPTY_MS = 2500UL;
 
 // Sip detection: after the bottle is lifted and placed back, a lower weight
 // means water was consumed. Values are grams ~= ml.
@@ -82,9 +78,17 @@ const float REFILL_DETECTION_MIN_RISE_GRAMS = 250.0;
 // Trigger the empty/low warning when estimated remaining water is below this.
 const float EMPTY_BOTTLE_WARNING_WATER_ML = 60.0;
 
-// Wait after the bottle returns before comparing weights.
+// Wait after the bottle returns before committing a sip/refill.
 // This avoids counting mechanical wobble while the platform settles.
-const unsigned long BOTTLE_RETURN_SETTLE_MS = 3000UL;
+// The UI can still get an early, non-committing sip candidate before this ends.
+const unsigned long BOTTLE_RETURN_SETTLE_MS = 1500UL;
+
+// After the bottle returns, wait only a short moment, then do one quick
+// non-committing check. If the weight is clearly lower, the frontend may show
+// the happy reaction immediately, while the Arduino still waits until
+// BOTTLE_RETURN_SETTLE_MS before updating totalDrankMl.
+const unsigned long EARLY_SIP_FEEDBACK_AFTER_RETURN_MS = 350UL;
+const float EARLY_SIP_FEEDBACK_MIN_DROP_GRAMS = 35.0;
 
 // Avoid duplicate events from the same physical action.
 const unsigned long SCALE_EVENT_COOLDOWN_MS = 3000UL;
@@ -105,6 +109,7 @@ bool scaleAutoEventsEnabled = true;
 bool bottlePresent = false;
 bool previousBottlePresent = false;
 bool pendingBottleReturnEvaluation = false;
+bool pendingBottleReturnEarlyFeedbackChecked = false;
 bool lastKnownBottleWeightInitialized = false;
 
 float estimatedWaterMl = 0.0;
@@ -142,7 +147,7 @@ void applyEmptyDetected();
 // ------------------------------------------------------------
 
 const int DAILY_GOAL_ML = 2000;
-const int SIP_AMOUNT_ML = 120;
+const int SIP_AMOUNT_ML = 500;
 
 // Demo timings.
 // For the Wizard-of-Oz prototype these are intentionally short.
@@ -330,8 +335,7 @@ void updateScaleReading(bool forceRead) {
     smoothedWeightInitialized = true;
   } else {
     smoothedWeightGrams =
-      (SCALE_SMOOTHING_ALPHA * lastWeightGrams) +
-      ((1.0 - SCALE_SMOOTHING_ALPHA) * smoothedWeightGrams);
+      (SCALE_SMOOTHING_ALPHA * lastWeightGrams) + ((1.0 - SCALE_SMOOTHING_ALPHA) * smoothedWeightGrams);
   }
 
   lastScaleReadAt = millis();
@@ -396,8 +400,7 @@ void updateBottleEstimateFromScale() {
   estimatedBottleFillPercent = constrain(
     (int)((estimatedWaterMl * 100.0 / BOTTLE_CAPACITY_ML) + 0.5),
     0,
-    100
-  );
+    100);
 
   // The physical scale is now the best source for bottle fill,
   // but only while the bottle is actually present.
@@ -407,6 +410,7 @@ void updateBottleEstimateFromScale() {
 void resetScaleEventTracking() {
   previousBottlePresent = bottlePresent;
   pendingBottleReturnEvaluation = false;
+  pendingBottleReturnEarlyFeedbackChecked = false;
   lastKnownBottleWeightInitialized = false;
   lastKnownBottleWeightGrams = 0.0;
   weightBeforeBottleLiftGrams = 0.0;
@@ -597,7 +601,7 @@ void applyMoodOutput() {
       break;
 
     case MOOD_SAD_2:
-       setRGB(255, 122, 0);
+      setRGB(255, 122, 0);
       break;
 
     case MOOD_SAD_3:
@@ -872,7 +876,7 @@ const char* moodToString(SippoMood mood) {
 
     case MOOD_REFILL:
       return "refill";
-    
+
     case MOOD_EMPTY:
       return "empty";
 
@@ -943,13 +947,11 @@ void sendNotFound(WiFiClient& client) {
 void sendStateJson(WiFiClient& client, const char* message) {
   sendCorsHeaders(client);
 
-  updateScaleReading();
-  updateBottleEstimateFromScale();
-
+  // Keep HTTP responses fast. Sensor reads happen continuously in loop(),
+  // and this function only returns the latest cached values.
   int goalPercent = min(
     100,
-    (int)((long)sippo.totalDrankMl * 100L / DAILY_GOAL_ML)
-  );
+    (int)((long)sippo.totalDrankMl * 100L / DAILY_GOAL_ML));
 
   client.print(F("{\"status\":\"ok\""));
 
@@ -1039,6 +1041,9 @@ void sendStateJson(WiFiClient& client, const char* message) {
   client.print(F(",\"emptyWarningEligible\":"));
   client.print(canShowEmptyWarningNow(millis()) ? F("true") : F("false"));
 
+  client.print(F(",\"pendingBottleReturnEvaluation\":"));
+  client.print(pendingBottleReturnEvaluation ? F("true") : F("false"));
+
   client.println(F("}"));
 }
 
@@ -1047,11 +1052,24 @@ void sendStateJson(WiFiClient& client, const char* message) {
 // Current source of Sippo events: React buttons.
 // Later this can stay as a debug/test interface, but dispatchEvent will be called by another function
 // ------------------------------------------------------------
+bool waitForScaleReady(unsigned long timeoutMs) {
+  unsigned long startedAt = millis();
+
+  while (millis() - startedAt < timeoutMs) {
+    if (scale.is_ready()) {
+      return true;
+    }
+
+    delay(10);
+  }
+
+  return false;
+}
 
 void handleClient(WiFiClient& client) {
   Serial.println(F("new client"));
 
-  client.setTimeout(1000);
+  client.setTimeout(200);
 
   String requestLine = client.readStringUntil('\r');
   client.readStringUntil('\n');
@@ -1079,13 +1097,62 @@ void handleClient(WiFiClient& client) {
   }
 
   else if (requestLine.startsWith("GET /api/scale/tare")) {
-    tareScale();
+    Serial.println(F("Scale tare requested. Waiting for HX711..."));
 
-    if (scaleReady && scaleTared) {
-      sendStateJson(client, "Scale tared");
-    } else {
+    // The HX711 may be temporarily not-ready if the loop just read it.
+    // Do not fail immediately; wait a few seconds for a fresh sample.
+    if (!waitForScaleReady(3000)) {
+      scaleReady = false;
+      setScaleEvent("scale_tare_failed");
       sendStateJson(client, "Scale tare failed - HX711 not ready");
+      return;
     }
+
+    Serial.println(F("Taring scale. Platform should be empty."));
+
+    bool previousScaleAutoEventsEnabled = scaleAutoEventsEnabled;
+    scaleAutoEventsEnabled = false;
+
+    scaleReady = true;
+    scale.set_scale(SCALE_CALIBRATION_FACTOR);
+
+    scale.tare(20);
+
+    scaleTared = true;
+
+    lastWeightGrams = 0.0;
+    smoothedWeightGrams = 0.0;
+    smoothedWeightInitialized = false;
+    lastScaleReadAt = 0;
+
+    bottlePresent = false;
+    previousBottlePresent = false;
+
+    pendingBottleReturnEvaluation = false;
+    pendingBottleReturnEarlyFeedbackChecked = false;
+
+    lastKnownBottleWeightInitialized = false;
+    lastKnownBottleWeightGrams = 0.0;
+    weightBeforeBottleLiftGrams = 0.0;
+    scaleDeltaSinceLastBottleWeightGrams = 0.0;
+
+    bottleReturnedAt = 0;
+    bottlePresentSinceAt = 0;
+    bottleAbsentSinceAt = millis();
+
+    wizardEmptyOverride = false;
+
+    // Read once after tare if possible, then reset the detection state.
+    updateScaleReading(true);
+    updateBottleEstimateFromScale();
+    resetScaleEventTracking();
+
+    scaleAutoEventsEnabled = previousScaleAutoEventsEnabled;
+
+    setScaleEvent("scale_tared");
+
+    Serial.println(F("Scale tare complete."));
+    sendStateJson(client, "Scale tared");
   }
 
   else if (requestLine.startsWith("GET /api/scale/auto/on")) {
@@ -1101,6 +1168,7 @@ void handleClient(WiFiClient& client) {
   else if (requestLine.startsWith("GET /api/scale/auto/off")) {
     scaleAutoEventsEnabled = false;
     pendingBottleReturnEvaluation = false;
+    pendingBottleReturnEarlyFeedbackChecked = false;
     setScaleEvent("scale_auto_off");
     sendStateJson(client, "Scale auto detection disabled");
   }
@@ -1209,6 +1277,7 @@ void pollSensorAdapters() {
       }
 
       pendingBottleReturnEvaluation = false;
+      pendingBottleReturnEarlyFeedbackChecked = false;
       wizardEmptyOverride = false;
       setScaleEvent("bottle_lifted");
     } else {
@@ -1224,6 +1293,7 @@ void pollSensorAdapters() {
 
       bottleReturnedAt = now;
       pendingBottleReturnEvaluation = true;
+      pendingBottleReturnEarlyFeedbackChecked = false;
       setScaleEvent("bottle_returned_waiting");
     }
 
@@ -1240,6 +1310,7 @@ void pollSensorAdapters() {
     // First time a bottle appears after startup/tare: treat it as the
     // baseline, not as a refill.
     pendingBottleReturnEvaluation = false;
+    pendingBottleReturnEarlyFeedbackChecked = false;
     acceptCurrentBottleWeightAsBaseline();
     weightBeforeBottleLiftGrams = lastKnownBottleWeightGrams;
     bottlePresentSinceAt = now;
@@ -1248,11 +1319,31 @@ void pollSensorAdapters() {
   }
 
   if (pendingBottleReturnEvaluation) {
+    // Middle ground for perceived agency:
+    // After a short delay, do one quick, non-committing check. If the bottle is
+    // already clearly lighter, tell the frontend it may start the happy
+    // reaction now. We still do NOT update drank ml or the baseline until the
+    // full settle window below has passed.
+    if (
+      !pendingBottleReturnEarlyFeedbackChecked && now - bottleReturnedAt >= EARLY_SIP_FEEDBACK_AFTER_RETURN_MS) {
+      pendingBottleReturnEarlyFeedbackChecked = true;
+
+      updateScaleReading(true);
+      float earlyDeltaGrams = lastWeightGrams - weightBeforeBottleLiftGrams;
+      scaleDeltaSinceLastBottleWeightGrams = earlyDeltaGrams;
+
+      if (
+        earlyDeltaGrams <= -EARLY_SIP_FEEDBACK_MIN_DROP_GRAMS && earlyDeltaGrams >= -SIP_DETECTION_MAX_DROP_GRAMS) {
+        setScaleEvent("scale_sip_candidate");
+      }
+    }
+
     if (now - bottleReturnedAt < BOTTLE_RETURN_SETTLE_MS) {
       return;
     }
 
     pendingBottleReturnEvaluation = false;
+    pendingBottleReturnEarlyFeedbackChecked = false;
 
     // Force one fresh sample after the settle time, then compare against the
     // stable weight from before the bottle was lifted.
@@ -1325,12 +1416,7 @@ void pollSensorAdapters() {
   bool rewardOrReactionStillPlaying = now < sippo.temporaryMoodUntil;
 
   if (
-    bottleStableForEmptyWarning &&
-    !pendingBottleReturnEvaluation &&
-    !rewardOrReactionStillPlaying &&
-    estimatedWaterMl <= EMPTY_BOTTLE_WARNING_WATER_ML &&
-    sippo.mood != MOOD_EMPTY
-  ) {
+    bottleStableForEmptyWarning && !pendingBottleReturnEvaluation && !rewardOrReactionStillPlaying && estimatedWaterMl <= EMPTY_BOTTLE_WARNING_WATER_ML && sippo.mood != MOOD_EMPTY) {
     wizardEmptyOverride = false;
     applyEmptyDetected();
     setScaleEvent("scale_empty");

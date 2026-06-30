@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { CSSProperties } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
 import './App.css'
 
 type SippoMood =
@@ -61,6 +61,7 @@ type SippoStateResponse = {
   scaleEventCounter?: number
   lastScaleEvent?: string
   emptyWarningEligible?: boolean
+  pendingBottleReturnEvaluation?: boolean
 }
 
 type SippoEventCommand = {
@@ -93,7 +94,7 @@ const HAPPY_REACTION_DURATION_MS = 5200
 const REFILL_REACTION_DURATION_MS = 4200
 const GOAL_REACTION_DURATION_MS = 8200
 
-const STATE_POLL_INTERVAL_MS = 1000
+const STATE_POLL_INTERVAL_MS = 1500
 
 const sippoEventCommands: SippoEventCommand[] = [
   {
@@ -202,6 +203,27 @@ function formatAgeMs(value: number | undefined) {
   return `${(value / 1000).toFixed(1)} s`
 }
 
+type StateCardVariant = 'sippo' | 'bottle' | 'debug'
+
+type StateCardProps = {
+  variant: StateCardVariant
+  label: string
+  value: ReactNode
+}
+
+function StateCard({ variant, label, value }: StateCardProps) {
+  const categoryLabel =
+    variant === 'sippo' ? 'Sippo' : variant === 'bottle' ? 'Bottle' : 'Debug'
+
+  return (
+    <div className={`state-card state-card--${variant}`}>
+      <span className="state-card__category">{categoryLabel}</span>
+      <span className="state-card__label">{label}</span>
+      <strong className="state-card__value">{value}</strong>
+    </div>
+  )
+}
+
 function shouldSuppressEmptyWarning(data: SippoStateResponse) {
   if (data.mood !== 'empty') {
     return false
@@ -220,6 +242,10 @@ function shouldSuppressEmptyWarning(data: SippoStateResponse) {
   }
 
   if (data.lastScaleEvent === 'bottle_returned_waiting') {
+    return true
+  }
+
+  if (data.pendingBottleReturnEvaluation) {
     return true
   }
 
@@ -254,6 +280,24 @@ function getActiveGifForState(data: SippoStateResponse): SippoGifKey {
   return 'idle'
 }
 
+
+async function fetchWithTimeout(url: string, timeoutMs: number) {
+  const controller = new AbortController()
+
+  const timeoutId = window.setTimeout(() => {
+    controller.abort()
+  }, timeoutMs)
+
+  try {
+    return await fetch(url, {
+      signal: controller.signal,
+      cache: 'no-store',
+    })
+  } finally {
+    window.clearTimeout(timeoutId)
+  }
+}
+
 function App() {
   const [arduinoBaseUrl, setArduinoBaseUrl] = useState(() => {
     return (
@@ -270,6 +314,7 @@ function App() {
   const sippoStateRef = useRef<SippoStateResponse | null>(null)
 
   const [currentGif, setCurrentGif] = useState<SippoGifKey>('idle')
+  const currentGifRef = useRef<SippoGifKey>('idle')
 
   // Changing this forces the <img> to remount.
   // That helps restart transition GIFs like falling asleep / waking up.
@@ -279,7 +324,14 @@ function App() {
   const lastHandledScaleEventCounterRef = useRef<number | null>(null)
   const temporaryGifTimeoutRef = useRef<number | null>(null)
 
+  // Arduino WiFiNINA can only handle a very small number of requests at once.
+  // These refs prevent overlapping /api/state polls and pause polling while a
+  // button command is being sent.
+  const isPollingRef = useRef(false)
+  const isSendingRef = useRef(false)
+
   function showGif(gif: SippoGifKey) {
+    currentGifRef.current = gif
     setCurrentGif(gif)
     setGifVersion((current) => current + 1)
   }
@@ -338,6 +390,33 @@ function App() {
 
     updateSippoState(data)
 
+    // If a tare command briefly showed an error, but the next Arduino state
+    // confirms that the scale is actually tared, trust the state and clear
+    // the stale error/status.
+    if (data.scaleTared) {
+      setErrorMessage((currentError) => {
+        if (
+          currentError?.includes('HX711 not ready') ||
+          currentError?.toLowerCase().includes('tare')
+        ) {
+          return null
+        }
+
+        return currentError
+      })
+
+      setStatusMessage((currentStatus) => {
+        if (
+          currentStatus?.toLowerCase().includes('tare failed') ||
+          currentStatus?.includes('HX711 not ready')
+        ) {
+          return 'Scale is tared'
+        }
+
+        return currentStatus
+      })
+    }
+
     if (options.allowScaleReaction && previous) {
       const scaleEvent = data.lastScaleEvent || ''
       const scaleEventCounter = data.scaleEventCounter ?? 0
@@ -352,10 +431,11 @@ function App() {
 
         const drankDelta = data.totalDrankMl - previous.totalDrankMl
 
+        const scaleDetectedSipCandidate = scaleEvent === 'scale_sip_candidate'
+
         const scaleDetectedSip =
           drankDelta > 0 &&
-          scaleEvent.startsWith('scale') &&
-          scaleEvent.includes('sip')
+          scaleEvent === 'scale_sip'
 
         const scaleDetectedRefill =
           scaleEvent.startsWith('scale') &&
@@ -365,15 +445,34 @@ function App() {
           scaleEvent === 'scale_empty' &&
           data.mood === 'empty'
 
+        if (scaleDetectedSipCandidate) {
+          // This is deliberately only an early acknowledgement, not a committed
+          // state update. The Arduino still waits for the scale to settle before
+          // increasing totalDrankMl. This keeps the interaction feeling causal
+          // without letting the frontend become the source of truth.
+          if (
+            !isGifTransitioningRef.current ||
+            currentGifRef.current !== 'happy'
+          ) {
+            showTemporaryGif('happy', HAPPY_REACTION_DURATION_MS, data)
+          }
+
+          setStatusMessage('Sippo noticed a possible sip… checking weight')
+          return
+        }
+
         if (scaleDetectedSip) {
           if (data.goalReached && !hasShownGoalAnimationRef.current) {
             hasShownGoalAnimationRef.current = true
             showTemporaryGif('goalReached', GOAL_REACTION_DURATION_MS, data)
-          } else {
+          } else if (
+            !isGifTransitioningRef.current ||
+            currentGifRef.current !== 'happy'
+          ) {
             showTemporaryGif('happy', HAPPY_REACTION_DURATION_MS, data)
           }
 
-          setStatusMessage(`Scale detected sip: +${drankDelta} ml`)
+          setStatusMessage(`Scale confirmed sip: +${drankDelta} ml`)
           return
         }
 
@@ -493,12 +592,27 @@ function App() {
       return
     }
 
+    if (!arduinoBaseUrl) {
+      setErrorMessage('Please enter the Arduino backend URL first.')
+      return
+    }
+
+    // Pause automatic polling while this command is in flight. Otherwise a
+    // queued /api/state request can block the actual button event on the Arduino.
+    isSendingRef.current = true
     setIsSending(true)
     setErrorMessage(null)
     setStatusMessage(`Sending "${command.label}" event...`)
 
     try {
-      const response = await fetch(`${arduinoBaseUrl}${command.path}`)
+      const commandTimeoutMs = command.path.startsWith('/api/scale/')
+        ? 12000
+        : 5000
+
+      const response = await fetchWithTimeout(
+        `${arduinoBaseUrl}${command.path}`,
+        commandTimeoutMs,
+      )
 
       if (!response.ok) {
         throw new Error(`Arduino responded with HTTP ${response.status}`)
@@ -520,7 +634,12 @@ function App() {
         scheduleStateRefresh(REFILL_REACTION_DURATION_MS)
       }
 
-      setStatusMessage(data.message || `Sippo event "${command.label}" applied`)
+      if (command.path === '/api/scale/tare' && data.scaleTared) {
+        setErrorMessage(null)
+        setStatusMessage('Scale is tared')
+      } else {
+        setStatusMessage(data.message || `Sippo event "${command.label}" applied`)
+      }
     } catch (error) {
       const message =
         error instanceof Error ? error.message : 'Unknown connection error'
@@ -528,51 +647,37 @@ function App() {
       setErrorMessage(message)
       setStatusMessage('Could not reach Arduino')
     } finally {
+      isSendingRef.current = false
       setIsSending(false)
     }
   }
 
   function scheduleStateRefresh(delayMs: number) {
     window.setTimeout(() => {
-      refreshSippoState()
+      refreshSippoStateSilently()
     }, delayMs)
   }
 
-  async function refreshSippoState() {
-    setIsSending(true)
-    setErrorMessage(null)
-    setStatusMessage('Refreshing Sippo state...')
-
-    try {
-      const response = await fetch(`${arduinoBaseUrl}/api/state`)
-
-      if (!response.ok) {
-        throw new Error(`Arduino responded with HTTP ${response.status}`)
-      }
-
-      const data = (await response.json()) as SippoStateResponse
-
-      if (data.status !== 'ok') {
-        throw new Error(data.message || 'Arduino returned an error')
-      }
-
-      applyStateFromArduino(data)
-
-      setStatusMessage(data.message || 'Sippo state refreshed')
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : 'Unknown connection error'
-
-      setErrorMessage(message)
-      setStatusMessage('Could not reach Arduino')
-    } finally {
-      setIsSending(false)
-    }
-  }
-
   async function refreshSippoStateSilently() {
+    if (!arduinoBaseUrl) {
+      return
+    }
+
+    // Do not overlap polls. If a previous /api/state request is still waiting,
+    // skip this tick instead of queueing another request on the Arduino.
+    if (isPollingRef.current) {
+      return
+    }
+
+    // Button commands have priority over background polling.
+    if (isSendingRef.current) {
+      return
+    }
+
+    isPollingRef.current = true
+
     try {
-      const response = await fetch(`${arduinoBaseUrl}/api/state`)
+      const response = await fetchWithTimeout(`${arduinoBaseUrl}/api/state`, 900)
 
       if (!response.ok) {
         return
@@ -587,7 +692,9 @@ function App() {
       applyStateFromArduino(data, { allowScaleReaction: true })
     } catch {
       // Silent polling should not spam the visible error box.
-      // Manual button presses still show errors through sendSippoEvent/refreshSippoState.
+      // Command buttons still show user-facing errors through sendSippoEvent.
+    } finally {
+      isPollingRef.current = false
     }
   }
 
@@ -693,77 +800,110 @@ function App() {
               </div>
             </section>
 
-            <aside className="sippo-sidebar">
-              <div className="sippo-state-grid sippo-state-grid--sidebar">
+            <aside className="sippo-sidebar sippo-sidebar--state-panel">
+              <div className="state-panel-header">
                 <div>
-                  <span>Mood</span>
-                  <strong>{sippoState?.mood || 'content'}</strong>
+                  <p className="state-panel-kicker">Live telemetry</p>
+                  <h2>State overview</h2>
                 </div>
 
-                <div>
-                  <span>Mode</span>
-                  <strong>{sippoState?.mode || 'awake'}</strong>
+                <div className="state-panel-legend" aria-label="State categories">
+                  <span className="state-panel-legend__item state-panel-legend__item--sippo">
+                    Sippo
+                  </span>
+                  <span className="state-panel-legend__item state-panel-legend__item--bottle">
+                    Bottle
+                  </span>
+                  <span className="state-panel-legend__item state-panel-legend__item--debug">
+                    Debug
+                  </span>
                 </div>
+              </div>
 
-                <div>
-                  <span>Reminder</span>
-                  <strong>{sippoState?.reminderLevel ?? 0}</strong>
-                </div>
+              <div className="sippo-state-grid sippo-state-grid--sidebar sippo-state-grid--compact">
+                <StateCard
+                  variant="sippo"
+                  label="Mood"
+                  value={sippoState?.mood || 'content'}
+                />
 
-                <div>
-                  <span>Scale</span>
-                  <strong>{scaleReadyLabel}</strong>
-                </div>
+                <StateCard
+                  variant="sippo"
+                  label="Mode"
+                  value={sippoState?.mode || 'awake'}
+                />
 
-                <div>
-                  <span>Scale tared</span>
-                  <strong>{scaleTaredLabel}</strong>
-                </div>
+                <StateCard
+                  variant="sippo"
+                  label="Reminder"
+                  value={sippoState?.reminderLevel ?? 0}
+                />
 
-                <div>
-                  <span>Scale auto</span>
-                  <strong>{scaleAutoLabel}</strong>
-                </div>
+                <StateCard
+                  variant="bottle"
+                  label="Bottle present"
+                  value={bottlePresentLabel}
+                />
 
-                <div>
-                  <span>Bottle present</span>
-                  <strong>{bottlePresentLabel}</strong>
-                </div>
+                <StateCard
+                  variant="bottle"
+                  label="Water"
+                  value={formatMl(sippoState?.estimatedWaterMl)}
+                />
 
-                <div>
-                  <span>Weight raw</span>
-                  <strong>{formatWeight(sippoState?.weightGrams)}</strong>
-                </div>
+                <StateCard
+                  variant="bottle"
+                  label="Scale fill"
+                  value={`${sippoState?.estimatedBottleFillPercent ?? '—'}%`}
+                />
 
-                <div>
-                  <span>Weight smooth</span>
-                  <strong>{formatWeight(sippoState?.smoothedWeightGrams)}</strong>
-                </div>
+                <StateCard
+                  variant="bottle"
+                  label="Weight"
+                  value={formatWeight(sippoState?.smoothedWeightGrams)}
+                />
 
-                <div>
-                  <span>Water by scale</span>
-                  <strong>{formatMl(sippoState?.estimatedWaterMl)}</strong>
-                </div>
+                <StateCard
+                  variant="debug"
+                  label="Scale"
+                  value={scaleReadyLabel}
+                />
 
-                <div>
-                  <span>Scale fill</span>
-                  <strong>{sippoState?.estimatedBottleFillPercent ?? '—'}%</strong>
-                </div>
+                <StateCard
+                  variant="debug"
+                  label="Tared"
+                  value={scaleTaredLabel}
+                />
 
-                <div>
-                  <span>Weight delta</span>
-                  <strong>{formatDelta(sippoState?.scaleDeltaSinceLastBottleWeightGrams)}</strong>
-                </div>
+                <StateCard
+                  variant="debug"
+                  label="Auto"
+                  value={scaleAutoLabel}
+                />
 
-                <div>
-                  <span>Last scale event</span>
-                  <strong>{sippoState?.lastScaleEvent || 'none'}</strong>
-                </div>
+                <StateCard
+                  variant="debug"
+                  label="Raw"
+                  value={formatWeight(sippoState?.weightGrams)}
+                />
 
-                <div>
-                  <span>Scale age</span>
-                  <strong>{formatAgeMs(sippoState?.scaleLastReadAgeMs)}</strong>
-                </div>
+                <StateCard
+                  variant="debug"
+                  label="Delta"
+                  value={formatDelta(sippoState?.scaleDeltaSinceLastBottleWeightGrams)}
+                />
+
+                <StateCard
+                  variant="debug"
+                  label="Last event"
+                  value={sippoState?.lastScaleEvent || 'none'}
+                />
+
+                <StateCard
+                  variant="debug"
+                  label="Age"
+                  value={formatAgeMs(sippoState?.scaleLastReadAgeMs)}
+                />
               </div>
             </aside>
           </div>
@@ -781,15 +921,6 @@ function App() {
                   {command.label}
                 </button>
               ))}
-
-              <button
-                type="button"
-                className="color-button"
-                onClick={refreshSippoState}
-                disabled={isSending}
-              >
-                Refresh state
-              </button>
             </div>
           </div>
         </div>
