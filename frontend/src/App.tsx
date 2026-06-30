@@ -980,7 +980,7 @@ function App() {
 
               <button
                 type="button"
-                className="color-button weather-goal-button"
+                className="color-button weather-goal-button apply-button"
                 onClick={updateGoalFromManualTemperature}
                 disabled={isSending || isFetchingWeather}
               >

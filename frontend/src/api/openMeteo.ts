@@ -52,6 +52,7 @@ async function fetchJson<T>(url: string, timeoutMs = 8000): Promise<T> {
 
 export async function searchOpenMeteoLocations(
   query: string,
+    countryCode = 'DE',
 ): Promise<OpenMeteoLocation[]> {
   const trimmedQuery = query.trim()
 
@@ -62,13 +63,16 @@ export async function searchOpenMeteoLocations(
   const url = new URL('https://geocoding-api.open-meteo.com/v1/search')
   url.searchParams.set('name', trimmedQuery)
   url.searchParams.set('count', '5')
-  url.searchParams.set('language', 'en')
+    url.searchParams.set('language', 'de')
   url.searchParams.set('format', 'json')
+
+    // Important: prefer German locations for our Sippo prototype
+    url.searchParams.set('countryCode', countryCode)
 
   const data = await fetchJson<OpenMeteoGeocodingResponse>(url.toString())
 
   if (!data.results?.length) {
-    throw new Error(`No location found for "${trimmedQuery}".`)
+      throw new Error(`No German location found for "${trimmedQuery}".`)
   }
 
   return data.results.map((result) => ({
@@ -103,11 +107,12 @@ export async function fetchTodayMaxTemperatureC(
   return maxTempC
 }
 
-export async function fetchTodayMaxTemperatureForLocationQuery(query: string) {
-  const locations = await searchOpenMeteoLocations(query)
+export async function fetchTodayMaxTemperatureForLocationQuery(
+    query: string,
+    countryCode = 'DE',
+) {
+    const locations = await searchOpenMeteoLocations(query, countryCode)
 
-  // Prototype simplification:
-  // Use the first result. Later you can show a dropdown if multiple cities match.
   const location = locations[0]
   const maxTempC = await fetchTodayMaxTemperatureC(location)
 
@@ -116,7 +121,6 @@ export async function fetchTodayMaxTemperatureForLocationQuery(query: string) {
     maxTempC,
   }
 }
-
 export function formatOpenMeteoLocation(location: OpenMeteoLocation) {
   return [location.name, location.admin1, location.country]
     .filter(Boolean)
