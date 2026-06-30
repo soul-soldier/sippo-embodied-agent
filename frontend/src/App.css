@@ -30,7 +30,7 @@ input {
 }
 
 .card {
-  width: min(100%, 1040px);
+  width: min(100%, 1240px);
   padding: 32px;
   border-radius: 28px;
   background: #1b1f2a;
@@ -90,18 +90,15 @@ h1 {
 }
 
 .sippo-main-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(500px, 1fr) minmax(540px, 1fr);
   gap: 20px;
-  align-items: flex-start;
+  align-items: stretch;
+  margin-bottom: 1rem;
 }
 
-.sippo-main-row > .sippo-display {
-  flex: 1 1 60%;
-  min-width: 0;
-}
-
+.sippo-main-row > .sippo-display,
 .sippo-sidebar {
-  flex: 1 1 40%;
   min-width: 0;
 }
 
@@ -173,14 +170,21 @@ h1 {
   background: rgb(255 80 80 / 16%);
 }
 
+/* ------------------------------------------------------------
+   Main Sippo display
+------------------------------------------------------------ */
+
 .sippo-display {
-  height: fit-content;
+  height: clamp(390px, 36vw, 430px);
   margin: 0;
   padding: 1rem;
   border-radius: 1.25rem;
   transition: background-color 250ms ease;
   position: relative;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
 }
 
 .sippo-display > * {
@@ -189,10 +193,11 @@ h1 {
 }
 
 .sippo-screen {
+  flex: 1;
+  min-height: 0;
   display: flex;
   justify-content: center;
   align-items: center;
-  min-height: 260px;
   padding: 1rem;
   border-radius: 1rem;
   background: rgba(255, 255, 255, 0.4);
@@ -201,24 +206,46 @@ h1 {
 
 .sippo-fish {
   width: min(280px, 80vw);
+  max-height: 100%;
   height: auto;
   image-rendering: auto;
 }
 
+/* ------------------------------------------------------------
+   Small tank stats inside Sippo display
+------------------------------------------------------------ */
+
 .sippo-state-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 0.75rem;
-  margin-top: 1rem;
 }
 
 .sippo-state-grid--tank {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
-.sippo-state-grid--sidebar {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+.sippo-state-grid--tank div {
+  padding: 0.75rem;
+  border-radius: 0.75rem;
+  background: rgba(255, 255, 255, 0.7);
 }
+
+.sippo-state-grid--tank span {
+  display: block;
+  font-size: 0.75rem;
+  opacity: 0.75;
+  color: #11131a;
+}
+
+.sippo-state-grid--tank strong {
+  display: block;
+  margin-top: 0.2rem;
+  color: black;
+}
+
+/* ------------------------------------------------------------
+   Right telemetry panel
+------------------------------------------------------------ */
 
 .sippo-sidebar {
   display: grid;
@@ -226,28 +253,182 @@ h1 {
   align-content: start;
 }
 
+.sippo-sidebar--state-panel {
+  height: clamp(390px, 36vw, 430px);
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.state-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.65rem;
+  flex: 0 0 auto;
+}
+
+.state-panel-kicker {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.state-panel-header h2 {
+  margin: 0.12rem 0 0;
+  color: rgba(255, 255, 255, 0.94);
+  font-size: 1.05rem;
+  line-height: 1.1;
+}
+
+.state-panel-legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.35rem;
+  max-width: 15rem;
+}
+
+.state-panel-legend__item {
+  border-radius: 999px;
+  padding: 0.25rem 0.48rem;
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.state-panel-legend__item--sippo {
+  background: rgba(105, 162, 255, 0.2);
+  color: #d8e7ff;
+}
+
+.state-panel-legend__item--bottle {
+  background: rgba(0, 201, 204, 0.18);
+  color: #d5feff;
+}
+
+.state-panel-legend__item--debug {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.68);
+}
+
+/* 4x4 state grid */
+.sippo-state-grid--sidebar.sippo-state-grid--compact {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-rows: repeat(4, minmax(0, 1fr));
+  gap: 0.55rem;
+}
+
+/* ------------------------------------------------------------
+   State cards
+------------------------------------------------------------ */
+
+.state-card {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  border-radius: 1rem;
+  padding: 0.58rem 0.62rem;
+  overflow: hidden;
+  border: 1px solid transparent;
+  box-shadow: none;
+}
+
+.state-card > * {
+  position: relative;
+  z-index: 1;
+}
+
+.state-card--sippo {
+  border-color: rgba(132, 176, 255, 0.35);
+  background: #26344f;
+}
+
+.state-card--bottle {
+  border-color: rgba(0, 201, 204, 0.35);
+  background: #1f454a;
+}
+
+.state-card--debug {
+  border-color: rgba(255, 255, 255, 0.16);
+  background: #2a2f3a;
+  border-style: dashed;
+  opacity: 0.78;
+}
+
+.state-card__category {
+  align-self: flex-start;
+  border-radius: 999px;
+  padding: 0.12rem 0.34rem;
+  margin-bottom: 0.28rem;
+  font-size: 0.54rem;
+  font-weight: 900;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.state-card--sippo .state-card__category {
+  background: #3d5684;
+  color: #e6f0ff;
+}
+
+.state-card--bottle .state-card__category {
+  background: #2d6a70;
+  color: #e1fdff;
+}
+
+.state-card--debug .state-card__category {
+  background: #3a404d;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.state-card__label {
+  display: block;
+  color: rgba(255, 255, 255, 0.66);
+  font-size: 0.72rem;
+  line-height: 1.05;
+}
+
+.state-card__value {
+  display: block;
+  margin-top: 0.18rem;
+  color: rgba(255, 255, 255, 0.96);
+  font-size: clamp(0.82rem, 1.08vw, 1.04rem);
+  line-height: 1.08;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.state-card--debug .state-card__value {
+  color: rgba(255, 255, 255, 0.76);
+  font-size: clamp(0.76rem, 0.95vw, 0.94rem);
+}
+
+/* ------------------------------------------------------------
+   Actions
+------------------------------------------------------------ */
+
 .sippo-action-grid {
   margin-top: 0;
 }
 
-.sippo-state-grid div {
-  padding: 0.75rem;
-  border-radius: 0.75rem;
-  background: rgba(255, 255, 255, 0.7);
-}
-
-.sippo-state-grid span {
-  display: block;
-  font-size: 0.75rem;
-  opacity: 0.75;
-  color: #11131a;
-}
-
-.sippo-state-grid strong {
-  display: block;
-  margin-top: 0.2rem;
-  color: black;
-}
+/* ------------------------------------------------------------
+   Empty bottle warning animation
+------------------------------------------------------------ */
 
 .sippo-display--empty-warning {
   animation: sippo-empty-water-pulse 1000ms ease-in-out infinite;
@@ -289,21 +470,80 @@ h1 {
   }
 }
 
+/* ------------------------------------------------------------
+   Responsive
+------------------------------------------------------------ */
+
+@media (max-width: 1120px) {
+  .card {
+    width: min(100%, 1040px);
+  }
+
+  .sippo-main-row {
+    grid-template-columns: 1fr;
+  }
+
+  .sippo-display,
+  .sippo-sidebar--state-panel {
+    height: auto;
+  }
+
+  .sippo-screen {
+    min-height: 260px;
+  }
+
+  .sippo-sidebar--state-panel {
+    overflow: visible;
+  }
+
+  .sippo-state-grid--sidebar.sippo-state-grid--compact {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-rows: auto;
+  }
+}
+
+@media (max-width: 720px) {
+  .button-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .sippo-state-grid--sidebar.sippo-state-grid--compact {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .state-panel-header {
+    flex-direction: column;
+  }
+
+  .state-panel-legend {
+    justify-content: flex-start;
+    max-width: none;
+  }
+}
+
 @media (max-width: 520px) {
   .card {
     padding: 24px;
   }
 
-  .sippo-main-row {
-    flex-direction: column;
+  .app-shell {
+    padding: 16px;
   }
 
   .sippo-dashboard {
     gap: 16px;
   }
 
-  .sippo-state-grid--tank,
-  .sippo-state-grid--sidebar {
+  .sippo-state-grid--tank {
     grid-template-columns: 1fr;
+  }
+
+  .button-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ip-field-wrapper {
+    align-items: stretch;
+    flex-direction: column;
   }
 }
