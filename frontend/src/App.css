@@ -547,3 +547,141 @@ h1 {
     flex-direction: column;
   }
 }
+/* ------------------------------------------------------------
+   Compact weather goal personalization row
+------------------------------------------------------------ */
+
+.weather-goal-card {
+  margin: 0 0 1rem;
+  padding: 1rem 2rem;
+  border-radius: 1.1rem;
+  border: 1px solid rgba(132, 176, 255, 0.22);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.weather-goal-card .state-panel-header {
+  margin-bottom: 0.5rem;
+}
+
+.weather-goal-hint {
+  align-self: start;
+  text-align: left;
+  padding-bottom: 1rem;
+  line-height: 1.35;
+  color: rgba(255, 255, 255, 0.74);
+  font-size: 0.9rem;
+}
+
+.weather-goal-card .state-panel-kicker {
+  font-size: 0.62rem;
+}
+
+.weather-goal-card h2 {
+  font-size: 1rem;
+  line-height: 1.1;
+}
+
+/* .weather-goal-card p {
+  max-width: 70rem;
+  margin: 0 0 0.75rem;
+  color: rgba(255, 255, 255, 0.74);
+  font-size: 0.88rem;
+  line-height: 1.35;
+}
+ */
+.weather-goal-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.75fr) minmax(9rem, 1fr) minmax(8rem, 0.85fr) minmax(8rem, 0.85fr) auto;
+  gap: 0.65rem;
+  align-items: stretch;
+}
+
+.weather-goal-card .field {
+  margin-bottom: 0;
+  gap: 0.3rem;
+}
+
+.weather-goal-card .field span,
+.weather-goal-base__label {
+  color: rgba(255, 255, 255, 0.66);
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.weather-goal-card .field input {
+  min-height: 2.8rem;
+  padding: 0.55rem 0.7rem;
+  border-radius: 0.8rem;
+}
+
+.weather-goal-base,
+.weather-goal-card .state-card {
+  min-height: 2.8rem;
+  border-radius: 0.8rem;
+  padding: 0.48rem 0.65rem;
+}
+
+.weather-goal-base {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  border: 1px solid rgba(132, 176, 255, 0.26);
+  background: #26344f;
+}
+
+.weather-goal-base strong {
+  margin-top: 0.2rem;
+  color: rgba(255, 255, 255, 0.96);
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.weather-goal-card .state-card__category {
+  display: none;
+}
+
+.weather-goal-card .state-card__label {
+  font-size: 0.72rem;
+}
+
+.weather-goal-card .state-card__value {
+  font-size: 1rem;
+}
+
+.weather-goal-button {
+  align-self: end;
+  min-height: 2.8rem;
+  padding-inline: 1rem;
+  border-radius: 0.85rem;
+  white-space: nowrap;
+}
+
+.weather-goal-row--api {
+  grid-template-columns:
+    minmax(7rem, 0.7fr)
+    minmax(11rem, 1.2fr)
+    minmax(7rem, 0.7fr)
+    minmax(8rem, 0.8fr)
+    minmax(8rem, 0.8fr)
+    auto;
+}
+
+.weather-goal-actions {
+  align-self: end;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.weather-goal-secondary-button {
+  background: #343b50;
+}
+
+.weather-location-hint {
+  text-align: left;
+  padding: 1rem 0.5rem;
+  margin-bottom: none;
+  line-height: 1.35;
+  color: rgba(255, 255, 255, 0.74);
+  font-size: 0.88rem;
+}
