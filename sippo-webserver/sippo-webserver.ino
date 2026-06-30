@@ -13,7 +13,7 @@
 //
 // false = normal mode: Sippo joins an existing Wi-Fi network from
 //         sippo-secrets.h and gets an IP from that router.
-const bool USE_AP_MODE = false;
+const bool USE_AP_MODE = true;
 
 // Access Point credentials.
 // Important: WiFiNINA AP SSID and password should both be at least 8 chars.
