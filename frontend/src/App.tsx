@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
 import './App.css'
+import {
+  fetchTodayMaxTemperatureForLocationQuery,
+  formatOpenMeteoLocation,
+} from './api/openMeteo'
 
 type SippoMood =
   | 'content'
@@ -95,6 +99,29 @@ const REFILL_REACTION_DURATION_MS = 4200
 const GOAL_REACTION_DURATION_MS = 8200
 
 const STATE_POLL_INTERVAL_MS = 1500
+
+const DEFAULT_BASE_GOAL_ML = 2000
+
+function calculateWeatherBonusMl(maxTempC: number) {
+  if (maxTempC >= 30) {
+    return 1000
+  }
+
+  if (maxTempC >= 25) {
+    return 500
+  }
+
+  return 0
+}
+
+function calculateWeatherAdjustedGoal(baseGoalMl: number, maxTempC: number) {
+  return baseGoalMl + calculateWeatherBonusMl(maxTempC)
+}
+
+function parseNumberInput(value: string) {
+  const parsed = Number(value.replace(',', '.'))
+  return Number.isFinite(parsed) ? parsed : Number.NaN
+}
 
 const sippoEventCommands: SippoEventCommand[] = [
   {
@@ -303,7 +330,7 @@ function App() {
     return (
       localStorage.getItem('sippoArduinoBaseUrl') ||
       import.meta.env.VITE_ARDUINO_BASE_URL ||
-      'http://192.168.178.114'
+      'http://192.168.4.1'
     )
   })
 
@@ -312,6 +339,20 @@ function App() {
   const [isSending, setIsSending] = useState(false)
   const [sippoState, setSippoState] = useState<SippoStateResponse | null>(null)
   const sippoStateRef = useRef<SippoStateResponse | null>(null)
+
+  const [maxTempInput, setMaxTempInput] = useState(() => {
+    return localStorage.getItem('sippoMaxTempC') || ''
+  })
+
+  const [locationInput, setLocationInput] = useState(() => {
+    return localStorage.getItem('sippoWeatherLocation') || ''
+  })
+
+  const [weatherLocationLabel, setWeatherLocationLabel] = useState<string | null>(
+    null,
+  )
+
+  const [isFetchingWeather, setIsFetchingWeather] = useState(false)
 
   const [currentGif, setCurrentGif] = useState<SippoGifKey>('idle')
   const currentGifRef = useRef<SippoGifKey>('idle')
@@ -652,6 +693,102 @@ function App() {
     }
   }
 
+  async function fetchWeatherFromOpenMeteo() {
+    const locationQuery = locationInput.trim()
+
+    if (!locationQuery) {
+      setErrorMessage('Please enter a location first.')
+      return
+    }
+
+    setIsFetchingWeather(true)
+    setErrorMessage(null)
+    setStatusMessage('Fetching weather from Open-Meteo...')
+
+    try {
+      const { location, maxTempC } =
+        await fetchTodayMaxTemperatureForLocationQuery(locationQuery)
+
+      const roundedMaxTemp = Math.round(maxTempC * 10) / 10
+      const maxTempValue = String(roundedMaxTemp)
+      const locationLabel = formatOpenMeteoLocation(location)
+
+      setMaxTempInput(maxTempValue)
+      setWeatherLocationLabel(locationLabel)
+
+      localStorage.setItem('sippoMaxTempC', maxTempValue)
+      localStorage.setItem('sippoWeatherLocation', locationQuery)
+
+      setStatusMessage(
+        `Weather loaded for ${locationLabel}: today's max temp is ${maxTempValue} °C`,
+      )
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Could not fetch weather.'
+
+      setErrorMessage(
+        `${message} You can still enter the max temperature manually.`,
+      )
+      setStatusMessage('Weather fetch failed')
+    } finally {
+      setIsFetchingWeather(false)
+    }
+  }
+
+  async function updateGoalFromManualTemperature() {
+    if (!arduinoBaseUrl) {
+      setErrorMessage('Please enter the Arduino backend URL first.')
+      return
+    }
+
+    const baseGoalMl = DEFAULT_BASE_GOAL_ML
+    const maxTempC = parseNumberInput(maxTempInput)
+
+    if (!Number.isFinite(maxTempC) || maxTempC < -30 || maxTempC > 60) {
+      setErrorMessage('Please enter a realistic max temperature between -30 °C and 60 °C.')
+      return
+    }
+
+    const weatherBonusMl = calculateWeatherBonusMl(maxTempC)
+    const adjustedGoalMl = calculateWeatherAdjustedGoal(baseGoalMl, maxTempC)
+
+    isSendingRef.current = true
+    setIsSending(true)
+    setErrorMessage(null)
+    setStatusMessage('Updating drinking goal...')
+
+    try {
+      const response = await fetchWithTimeout(
+        `${arduinoBaseUrl}/api/config/goal?ml=${encodeURIComponent(adjustedGoalMl)}`,
+        5000,
+      )
+
+      if (!response.ok) {
+        throw new Error(`Arduino responded with HTTP ${response.status}`)
+      }
+
+      const data = (await response.json()) as SippoStateResponse
+
+      if (data.status !== 'ok') {
+        throw new Error(data.message || 'Arduino returned an error')
+      }
+
+      applyStateFromArduino(data)
+      setStatusMessage(
+        `Goal updated: ${baseGoalMl} ml base + ${weatherBonusMl} ml weather bonus = ${adjustedGoalMl} ml`,
+      )
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Unknown connection error'
+
+      setErrorMessage(message)
+      setStatusMessage('Could not update drinking goal')
+    } finally {
+      isSendingRef.current = false
+      setIsSending(false)
+    }
+  }
+
   function scheduleStateRefresh(delayMs: number) {
     window.setTimeout(() => {
       refreshSippoStateSilently()
@@ -716,6 +853,16 @@ function App() {
   const scaleAutoLabel = sippoState?.scaleAutoEventsEnabled ? 'on' : 'off'
   const bottlePresentLabel = sippoState?.bottlePresent ? 'yes' : 'no'
 
+  const manualBaseGoalMl = DEFAULT_BASE_GOAL_ML
+  const manualMaxTempC = parseNumberInput(maxTempInput)
+  const canPreviewWeatherGoal = Number.isFinite(manualMaxTempC)
+  const weatherBonusPreviewMl = canPreviewWeatherGoal
+    ? calculateWeatherBonusMl(manualMaxTempC)
+    : 0
+  const adjustedGoalPreviewMl = canPreviewWeatherGoal
+    ? calculateWeatherAdjustedGoal(manualBaseGoalMl, manualMaxTempC)
+    : null
+
   useEffect(() => {
     refreshSippoStateSilently()
 
@@ -745,7 +892,7 @@ function App() {
                 setArduinoBaseUrl(value)
                 localStorage.setItem('sippoArduinoBaseUrl', value)
               }}
-              placeholder="http://192.168.178.114"
+              placeholder="http://192.168.4.1"
           />
 
 
@@ -762,6 +909,92 @@ function App() {
             </button>
           </div>
         </label>
+
+
+
+        <section className="weather-goal-card">
+          <div className="state-panel-header">
+            <div>
+              <h2>Adjust drinking goal</h2>
+            </div>
+          </div>
+
+          <p className="weather-goal-hint">
+            Enter today’s expected max temperature manually, or fetch it from Open-Meteo. Don't forget to Apply.
+          </p>
+
+          <div className="weather-goal-row weather-goal-row--api">
+
+            <label className="field weather-goal-location-field">
+              <span>Location</span>
+              <input
+                type="text"
+                value={locationInput}
+                onChange={(event) => {
+                  const value = event.target.value
+                  setLocationInput(value)
+                  localStorage.setItem('sippoWeatherLocation', value)
+                }}
+                placeholder="Karlsruhe"
+              />
+            </label>
+
+            <label className="field weather-goal-temp-field">
+              <span>Max temp (°C)</span>
+              <input
+                type="number"
+                min="-30"
+                max="60"
+                step="0.5"
+                value={maxTempInput}
+                onChange={(event) => {
+                  const value = event.target.value
+                  setMaxTempInput(value)
+                  localStorage.setItem('sippoMaxTempC', value)
+                }}
+                placeholder="28"
+              />
+            </label>
+
+            <StateCard
+              variant="sippo"
+              label="Weather bonus"
+              value={`+${weatherBonusPreviewMl} ml`}
+            />
+
+            <StateCard
+              variant="sippo"
+              label="New goal"
+              value={adjustedGoalPreviewMl === null ? '—' : `${adjustedGoalPreviewMl} ml`}
+            />
+
+            <div className="weather-goal-actions">
+              <button
+                type="button"
+                className="color-button weather-goal-button weather-goal-secondary-button"
+                onClick={fetchWeatherFromOpenMeteo}
+                disabled={isFetchingWeather}
+              >
+                {isFetchingWeather ? 'Fetching...' : 'Fetch'}
+              </button>
+
+              <button
+                type="button"
+                className="color-button weather-goal-button apply-button"
+                onClick={updateGoalFromManualTemperature}
+                disabled={isSending || isFetchingWeather}
+              >
+                Apply
+              </button>
+            </div>
+          </div>
+
+          {weatherLocationLabel && (
+            <p className="weather-location-hint">
+              Weather location: {weatherLocationLabel}
+            </p>
+          )}
+        </section>
 
         <div className="sippo-dashboard">
           <div className="sippo-main-row">

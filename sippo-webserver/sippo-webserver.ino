@@ -121,13 +121,19 @@ void setScaleEvent(const char* eventName);
 void applySipDetected(int amountMl);
 void applyRefillDetected();
 void applyEmptyDetected();
+int parseQueryIntParam(const String& requestLine, const char* paramName, int fallbackValue);
+void setDailyGoalMl(int newGoalMl);
 
 // ------------------------------------------------------------
 // Sippo configuration
 // ------------------------------------------------------------
 
-const int DAILY_GOAL_ML = 2000;
+const int DEFAULT_DAILY_GOAL_ML = 2000;
+const int MIN_DAILY_GOAL_ML = 500;
+const int MAX_DAILY_GOAL_ML = 6000;
 const int SIP_AMOUNT_ML = 500;
+
+int dailyGoalMl = DEFAULT_DAILY_GOAL_ML;
 
 // Demo timings
 const unsigned long REMINDER_1_AFTER_MS = 30UL * 1000UL;
@@ -765,7 +771,7 @@ void applySipDetected(int amountMl) {
     sippo.bottleFillPercent = max(0, sippo.bottleFillPercent - fillDropPercent);
   }
 
-  if (sippo.totalDrankMl >= DAILY_GOAL_ML) {
+  if (sippo.totalDrankMl >= dailyGoalMl) {
     sippo.goalReached = true;
     sippo.mood = MOOD_GOAL;
     sippo.temporaryMoodUntil = now + GOAL_ANIMATION_MS;
@@ -982,7 +988,7 @@ void sendStateJson(WiFiClient& client, const char* message) {
   // and this function only returns the latest cached values.
   int goalPercent = min(
     100,
-    (int)((long)sippo.totalDrankMl * 100L / DAILY_GOAL_ML));
+    (int)((long)sippo.totalDrankMl * 100L / max(1, dailyGoalMl)));
 
   client.print(F("{\"status\":\"ok\""));
 
@@ -1009,7 +1015,7 @@ void sendStateJson(WiFiClient& client, const char* message) {
   client.print(sippo.totalDrankMl);
 
   client.print(F(",\"dailyGoalMl\":"));
-  client.print(DAILY_GOAL_ML);
+  client.print(dailyGoalMl);
 
   client.print(F(",\"goalPercent\":"));
   client.print(goalPercent);
@@ -1083,6 +1089,55 @@ void sendStateJson(WiFiClient& client, const char* message) {
 // Current source of Sippo events: React buttons.
 // Later this can stay as a debug/test interface, but dispatchEvent will be called by another function
 // ------------------------------------------------------------
+
+int parseQueryIntParam(const String& requestLine, const char* paramName, int fallbackValue) {
+  String marker = String(paramName) + "=";
+  int valueStart = requestLine.indexOf(marker);
+
+  if (valueStart < 0) {
+    return fallbackValue;
+  }
+
+  valueStart += marker.length();
+
+  int valueEnd = requestLine.indexOf('&', valueStart);
+  int requestEnd = requestLine.indexOf(' ', valueStart);
+
+  if (valueEnd < 0 || (requestEnd >= 0 && requestEnd < valueEnd)) {
+    valueEnd = requestEnd;
+  }
+
+  if (valueEnd < 0) {
+    valueEnd = requestLine.length();
+  }
+
+  String rawValue = requestLine.substring(valueStart, valueEnd);
+  rawValue.trim();
+
+  if (rawValue.length() == 0) {
+    return fallbackValue;
+  }
+
+  return rawValue.toInt();
+}
+
+void setDailyGoalMl(int newGoalMl) {
+  int constrainedGoalMl = constrain(
+    newGoalMl,
+    MIN_DAILY_GOAL_ML,
+    MAX_DAILY_GOAL_ML);
+
+  dailyGoalMl = constrainedGoalMl;
+  sippo.goalReached = sippo.totalDrankMl >= dailyGoalMl;
+
+  // If the goal is increased after it had already been reached, remove the
+  // stale goal celebration state. The next real sip can trigger it again.
+  if (!sippo.goalReached && sippo.mood == MOOD_GOAL) {
+    sippo.mood = MOOD_CONTENT;
+    sippo.temporaryMoodUntil = 0;
+  }
+}
+
 bool waitForScaleReady(unsigned long timeoutMs) {
   unsigned long startedAt = millis();
 
@@ -1120,6 +1175,20 @@ void handleClient(WiFiClient& client) {
   if (requestLine.startsWith("OPTIONS ")) {
     sendCorsHeaders(client);
     client.println(F("{\"status\":\"ok\"}"));
+  }
+
+
+  else if (requestLine.startsWith("GET /api/config/goal")) {
+    int requestedGoalMl = parseQueryIntParam(requestLine, "ml", -1);
+
+    if (requestedGoalMl <= 0) {
+      sendStateJson(client, "Missing or invalid goal ml value");
+      return;
+    }
+
+    setDailyGoalMl(requestedGoalMl);
+    updateSippoStateMachine();
+    sendStateJson(client, "Daily goal updated");
   }
 
   else if (requestLine.startsWith("GET /api/state")) {
