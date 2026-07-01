@@ -6,6 +6,18 @@ import {
   formatOpenMeteoLocation,
 } from './api/openMeteo'
 
+import {
+  calculatePersonalizedGoalMl,
+  DEFAULT_GOAL_ACTIVITY_MINUTES,
+  DEFAULT_GOAL_ACTIVITY_TYPE,
+  DEFAULT_GOAL_GENDER,
+  DEFAULT_GOAL_HEIGHT_CM,
+  DEFAULT_GOAL_WEIGHT_KG,
+  parseNumberInput,
+  type ActivityType,
+  type GoalGender,
+} from './lib/hydrationGoal'
+
 type SippoMood =
   | 'content'
   | 'happy'
@@ -30,6 +42,7 @@ type SippoGifKey =
   | 'sad3'
   | 'happy'
   | 'bottleEmpty'
+  | 'refillDetected'
 
 type SippoStateResponse = {
   status: 'ok' | 'error'
@@ -44,8 +57,6 @@ type SippoStateResponse = {
   bottleFillPercent: number
   goalReached: boolean
 
-  // Added by the scale-enabled Arduino endpoint.
-  // Marked optional so the frontend still works with older sketches.
   scaleReady?: boolean
   scaleTared?: boolean
   weightGrams?: number
@@ -53,7 +64,6 @@ type SippoStateResponse = {
   scaleCalibrationFactor?: number
   scaleLastReadAgeMs?: number
 
-  // Added by the scale-auto-detection Arduino endpoint.
   scaleAutoEventsEnabled?: boolean
   bottlePresent?: boolean
   estimatedWaterMl?: number
@@ -72,10 +82,6 @@ type SippoEventCommand = {
   key: string
   label: string
   path: string
-
-  // Some buttons are presentation-only. They show the animation in the
-  // frontend but do not change the Arduino state, because the scale is the
-  // source of truth for bottle fill/refill/empty.
   frontendOnlyAction?: 'refillDemo' | 'emptyDemo'
 }
 
@@ -90,38 +96,16 @@ const sippoGifPaths: Record<SippoGifKey, string> = {
   sad3: '/sippo/sad3.gif',
   happy: '/sippo/happy.gif',
   bottleEmpty: '/sippo/bottle-empty.gif',
+  refillDetected: '/sippo/refill-detected.gif',
 }
 
 const FALL_ASLEEP_DURATION_MS = 2500
 const WAKE_UP_DURATION_MS = 2500
 const HAPPY_REACTION_DURATION_MS = 5200
-const REFILL_REACTION_DURATION_MS = 4200
+const REFILL_REACTION_DURATION_MS = 5200
 const GOAL_REACTION_DURATION_MS = 8200
 
 const STATE_POLL_INTERVAL_MS = 1500
-
-const DEFAULT_BASE_GOAL_ML = 2000
-
-function calculateWeatherBonusMl(maxTempC: number) {
-  if (maxTempC >= 30) {
-    return 1000
-  }
-
-  if (maxTempC >= 25) {
-    return 500
-  }
-
-  return 0
-}
-
-function calculateWeatherAdjustedGoal(baseGoalMl: number, maxTempC: number) {
-  return baseGoalMl + calculateWeatherBonusMl(maxTempC)
-}
-
-function parseNumberInput(value: string) {
-  const parsed = Number(value.replace(',', '.'))
-  return Number.isFinite(parsed) ? parsed : Number.NaN
-}
 
 const sippoEventCommands: SippoEventCommand[] = [
   {
@@ -239,12 +223,9 @@ type StateCardProps = {
 }
 
 function StateCard({ variant, label, value }: StateCardProps) {
-  const categoryLabel =
-    variant === 'sippo' ? 'Sippo' : variant === 'bottle' ? 'Bottle' : 'Debug'
 
   return (
     <div className={`state-card state-card--${variant}`}>
-      <span className="state-card__category">{categoryLabel}</span>
       <span className="state-card__label">{label}</span>
       <strong className="state-card__value">{value}</strong>
     </div>
@@ -256,10 +237,6 @@ function shouldSuppressEmptyWarning(data: SippoStateResponse) {
     return false
   }
 
-  // With scale auto detection active, the Arduino may briefly know that the
-  // fill percentage is low while it is still waiting to decide whether the
-  // latest bottle return was a sip or refill. During that window we should not
-  // show the empty GIF/water warning yet.
   if (!data.scaleAutoEventsEnabled) {
     return false
   }
@@ -348,6 +325,41 @@ function App() {
     return localStorage.getItem('sippoWeatherLocation') || ''
   })
 
+  const [goalGender, setGoalGender] = useState<GoalGender>(() => {
+    const savedValue = localStorage.getItem('sippoGoalGender') as GoalGender | null
+
+    if (savedValue === 'female' || savedValue === 'male' || savedValue === 'other') {
+      return savedValue
+    }
+
+    return DEFAULT_GOAL_GENDER
+  })
+
+  const [goalHeightCmInput, setGoalHeightCmInput] = useState(() => {
+    return localStorage.getItem('sippoGoalHeightCm') || DEFAULT_GOAL_HEIGHT_CM
+  })
+
+  const [goalWeightKgInput, setGoalWeightKgInput] = useState(() => {
+    return localStorage.getItem('sippoGoalWeightKg') || DEFAULT_GOAL_WEIGHT_KG
+  })
+
+  const [goalActivityType, setGoalActivityType] = useState<ActivityType>(() => {
+    const savedValue = localStorage.getItem('sippoGoalActivityType') as ActivityType | null
+
+    if (savedValue === 'none' || savedValue === 'light' || savedValue === 'hard') {
+      return savedValue
+    }
+
+    return DEFAULT_GOAL_ACTIVITY_TYPE
+  })
+
+  const [goalActivityMinutesInput, setGoalActivityMinutesInput] = useState(() => {
+    return (
+      localStorage.getItem('sippoGoalActivityMinutes') ||
+      DEFAULT_GOAL_ACTIVITY_MINUTES
+    )
+  })
+
   const [weatherLocationLabel, setWeatherLocationLabel] = useState<string | null>(
     null,
   )
@@ -356,18 +368,14 @@ function App() {
 
   const [currentGif, setCurrentGif] = useState<SippoGifKey>('idle')
   const currentGifRef = useRef<SippoGifKey>('idle')
-
-  // Changing this forces the <img> to remount.
-  // That helps restart transition GIFs like falling asleep / waking up.
+  const [temporaryDisplayEffect, setTemporaryDisplayEffect] =
+    useState<'refillDetected' | null>(null)
   const [gifVersion, setGifVersion] = useState(0)
   const isGifTransitioningRef = useRef(false)
   const hasShownGoalAnimationRef = useRef(false)
+
   const lastHandledScaleEventCounterRef = useRef<number | null>(null)
   const temporaryGifTimeoutRef = useRef<number | null>(null)
-
-  // Arduino WiFiNINA can only handle a very small number of requests at once.
-  // These refs prevent overlapping /api/state polls and pause polling while a
-  // button command is being sent.
   const isPollingRef = useRef(false)
   const isSendingRef = useRef(false)
 
@@ -381,6 +389,7 @@ function App() {
     gif: SippoGifKey,
     durationMs: number,
     finalState: SippoStateResponse,
+    options: { displayEffect?: 'refillDetected' } = {},
   ) {
     if (temporaryGifTimeoutRef.current !== null) {
       window.clearTimeout(temporaryGifTimeoutRef.current)
@@ -388,10 +397,12 @@ function App() {
     }
 
     isGifTransitioningRef.current = true
+    setTemporaryDisplayEffect(options.displayEffect ?? null)
     showGif(gif)
 
     temporaryGifTimeoutRef.current = window.setTimeout(() => {
       showGif(getActiveGifForState(sippoStateRef.current ?? finalState))
+      setTemporaryDisplayEffect(null)
       isGifTransitioningRef.current = false
       temporaryGifTimeoutRef.current = null
     }, durationMs)
@@ -418,6 +429,7 @@ function App() {
         return current
       }
 
+      currentGifRef.current = nextGif
       setGifVersion((version) => version + 1)
       return nextGif
     })
@@ -518,7 +530,9 @@ function App() {
         }
 
         if (scaleDetectedRefill) {
-          showTemporaryGif('happy', REFILL_REACTION_DURATION_MS, data)
+          showTemporaryGif('refillDetected', REFILL_REACTION_DURATION_MS, data, {
+            displayEffect: 'refillDetected',
+          })
           setStatusMessage('Scale detected refill')
           return
         }
@@ -584,15 +598,15 @@ function App() {
       return
     }
 
-    if (command.key === 'sip' || command.key === 'refill') {
-      isGifTransitioningRef.current = true
-      showGif('happy')
+    if (command.key === 'sip') {
+      showTemporaryGif('happy', HAPPY_REACTION_DURATION_MS, data)
+      return
+    }
 
-      window.setTimeout(() => {
-        showGif(getActiveGifForState(sippoStateRef.current ?? data))
-        isGifTransitioningRef.current = false
-      }, HAPPY_REACTION_DURATION_MS)
-
+    if (command.key === 'refill') {
+      showTemporaryGif('refillDetected', REFILL_REACTION_DURATION_MS, data, {
+        displayEffect: 'refillDetected',
+      })
       return
     }
 
@@ -608,9 +622,17 @@ function App() {
       setStatusMessage('Showing refill demo only. Arduino scale state was not changed.')
 
       if (currentState) {
-        showTemporaryGif('happy', REFILL_REACTION_DURATION_MS, currentState)
+        showTemporaryGif('refillDetected', REFILL_REACTION_DURATION_MS, currentState, {
+          displayEffect: 'refillDetected',
+        })
       } else {
-        showGif('happy')
+        setTemporaryDisplayEffect('refillDetected')
+        showGif('refillDetected')
+
+        window.setTimeout(() => {
+          setTemporaryDisplayEffect(null)
+          showGif('idle')
+        }, REFILL_REACTION_DURATION_MS)
       }
 
       return
@@ -638,8 +660,7 @@ function App() {
       return
     }
 
-    // Pause automatic polling while this command is in flight. Otherwise a
-    // queued /api/state request can block the actual button event on the Arduino.
+    // Pause automatic polling while command is in flight
     isSendingRef.current = true
     setIsSending(true)
     setErrorMessage(null)
@@ -735,22 +756,52 @@ function App() {
     }
   }
 
-  async function updateGoalFromManualTemperature() {
+  async function updateGoalFromPersonalizedInputs() {
     if (!arduinoBaseUrl) {
       setErrorMessage('Please enter the Arduino backend URL first.')
       return
     }
 
-    const baseGoalMl = DEFAULT_BASE_GOAL_ML
-    const maxTempC = parseNumberInput(maxTempInput)
+    const heightCm = parseNumberInput(goalHeightCmInput)
+    const weightKg = parseNumberInput(goalWeightKgInput)
+    const activityMinutes = parseNumberInput(goalActivityMinutesInput)
+    const parsedMaxTempC = parseNumberInput(maxTempInput)
+    const hasWeatherInput = maxTempInput.trim().length > 0 && Number.isFinite(parsedMaxTempC)
+    const maxTempC = hasWeatherInput ? parsedMaxTempC : null
 
-    if (!Number.isFinite(maxTempC) || maxTempC < -30 || maxTempC > 60) {
+    if (!Number.isFinite(heightCm) || heightCm < 120 || heightCm > 230) {
+      setErrorMessage('Please enter a realistic height between 120 cm and 230 cm.')
+      return
+    }
+
+    if (!Number.isFinite(weightKg) || weightKg < 30 || weightKg > 250) {
+      setErrorMessage('Please enter a realistic bodyweight between 30 kg and 250 kg.')
+      return
+    }
+
+    if (!Number.isFinite(activityMinutes) || activityMinutes < 0 || activityMinutes > 240) {
+      setErrorMessage('Please enter activity time between 0 and 240 minutes.')
+      return
+    }
+
+    if (maxTempInput.trim().length > 0 && (!Number.isFinite(parsedMaxTempC) || parsedMaxTempC < -30 || parsedMaxTempC > 60)) {
       setErrorMessage('Please enter a realistic max temperature between -30 °C and 60 °C.')
       return
     }
 
-    const weatherBonusMl = calculateWeatherBonusMl(maxTempC)
-    const adjustedGoalMl = calculateWeatherAdjustedGoal(baseGoalMl, maxTempC)
+    const calculation = calculatePersonalizedGoalMl({
+      gender: goalGender,
+      heightCm,
+      weightKg,
+      activityType: goalActivityType,
+      activityMinutes,
+      maxTempC,
+    })
+
+    if (!Number.isFinite(calculation.baseGoalMl) || calculation.baseGoalMl <= 0) {
+      setErrorMessage('Please enter valid body measurements to calculate the goal.')
+      return
+    }
 
     isSendingRef.current = true
     setIsSending(true)
@@ -758,8 +809,13 @@ function App() {
     setStatusMessage('Updating drinking goal...')
 
     try {
+      const newGoalMl = Math.round(calculation.adjustedGoalMl)
+
+      const url = new URL(`${arduinoBaseUrl}/api/config/goal`)
+      url.searchParams.set('ml', String(newGoalMl))
+
       const response = await fetchWithTimeout(
-        `${arduinoBaseUrl}/api/config/goal?ml=${encodeURIComponent(adjustedGoalMl)}`,
+        url.toString(),
         5000,
       )
 
@@ -775,7 +831,7 @@ function App() {
 
       applyStateFromArduino(data)
       setStatusMessage(
-        `Goal updated: ${baseGoalMl} ml base + ${weatherBonusMl} ml weather bonus = ${adjustedGoalMl} ml`,
+        `Goal updated: ${calculation.baseGoalMl} ml base + ${calculation.activityBonusMl} ml activity + ${calculation.weatherBonusMl} ml weather = ${data.dailyGoalMl} ml`,
       )
     } catch (error) {
       const message =
@@ -800,8 +856,7 @@ function App() {
       return
     }
 
-    // Do not overlap polls. If a previous /api/state request is still waiting,
-    // skip this tick instead of queueing another request on the Arduino.
+    // Do not overlap polls
     if (isPollingRef.current) {
       return
     }
@@ -828,8 +883,7 @@ function App() {
 
       applyStateFromArduino(data, { allowScaleReaction: true })
     } catch {
-      // Silent polling should not spam the visible error box.
-      // Command buttons still show user-facing errors through sendSippoEvent.
+
     } finally {
       isPollingRef.current = false
     }
@@ -837,9 +891,14 @@ function App() {
 
   const isEmptyBottleWarning =
     sippoState?.mood === 'empty' && !shouldSuppressEmptyWarning(sippoState)
+  const isRefillDetectedReaction =
+    temporaryDisplayEffect === 'refillDetected' && !isEmptyBottleWarning
+
   const displayColor = isEmptyBottleWarning
     ? '#FF3700'
-    : sippoState?.colorHex || '#00C9CC'
+    : isRefillDetectedReaction
+      ? '#063D24'
+      : sippoState?.colorHex || '#00C9CC'
 
   const sippoDisplayStyle = {
     '--sippo-display-color': displayColor,
@@ -853,15 +912,31 @@ function App() {
   const scaleAutoLabel = sippoState?.scaleAutoEventsEnabled ? 'on' : 'off'
   const bottlePresentLabel = sippoState?.bottlePresent ? 'yes' : 'no'
 
-  const manualBaseGoalMl = DEFAULT_BASE_GOAL_ML
-  const manualMaxTempC = parseNumberInput(maxTempInput)
-  const canPreviewWeatherGoal = Number.isFinite(manualMaxTempC)
-  const weatherBonusPreviewMl = canPreviewWeatherGoal
-    ? calculateWeatherBonusMl(manualMaxTempC)
-    : 0
-  const adjustedGoalPreviewMl = canPreviewWeatherGoal
-    ? calculateWeatherAdjustedGoal(manualBaseGoalMl, manualMaxTempC)
-    : null
+  const parsedHeightCm = parseNumberInput(goalHeightCmInput)
+  const parsedWeightKg = parseNumberInput(goalWeightKgInput)
+  const parsedActivityMinutes = parseNumberInput(goalActivityMinutesInput)
+  const parsedWeatherTemp = parseNumberInput(maxTempInput)
+  const weatherTempForPreview =
+    maxTempInput.trim().length > 0 && Number.isFinite(parsedWeatherTemp)
+      ? parsedWeatherTemp
+      : null
+  const goalPreview =
+    Number.isFinite(parsedHeightCm) &&
+      Number.isFinite(parsedWeightKg) &&
+      Number.isFinite(parsedActivityMinutes)
+      ? calculatePersonalizedGoalMl({
+        gender: goalGender,
+        heightCm: parsedHeightCm,
+        weightKg: parsedWeightKg,
+        activityType: goalActivityType,
+        activityMinutes: parsedActivityMinutes,
+        maxTempC: weatherTempForPreview,
+      })
+      : null
+  const weatherBonusPreviewMl = goalPreview?.weatherBonusMl ?? 0
+  const activityBonusPreviewMl = goalPreview?.activityBonusMl ?? 0
+  const baseGoalPreviewMl = goalPreview?.baseGoalMl ?? null
+  const adjustedGoalPreviewMl = goalPreview?.adjustedGoalMl ?? null
 
   useEffect(() => {
     refreshSippoStateSilently()
@@ -878,288 +953,388 @@ function App() {
   return (
     <main className="app-shell">
       <section className="card">
-        <p className="eyebrow">Sippo Embodied Agent</p>
+        <p className="app-eyebrow">Sippo Embodied Agent</p>
 
-        <h1>Sippo Control Panel</h1>
+        <h1 className="app-title">Sippo Control Panel</h1>
 
-        <label className="field">
-          <span>Arduino backend URL</span>
-          <div className="ip-field-wrapper">
-          <input
-            value={arduinoBaseUrl}
-              onChange={(event) => {
-                const value = event.target.value
-                setArduinoBaseUrl(value)
-                localStorage.setItem('sippoArduinoBaseUrl', value)
-              }}
-              placeholder="http://192.168.4.1"
-          />
+        <div className="dashboard-layout">
+          <section className="personalization-dashboard">
 
-
-            <button
-              type="button"
-              className="color-button"
-              onClick={() => {
-                localStorage.removeItem('sippoArduinoBaseUrl')
-                setArduinoBaseUrl('')
-                setStatusMessage('Cached Arduino URL cleared')
-              }}
-            >
-              Clear saved IP
-            </button>
-          </div>
-        </label>
-
-
-
-        <section className="weather-goal-card">
-          <div className="state-panel-header">
-            <div>
-              <h2>Adjust drinking goal</h2>
-            </div>
-          </div>
-
-          <p className="weather-goal-hint">
-            Enter today’s expected max temperature manually, or fetch it from Open-Meteo. Don't forget to Apply.
-          </p>
-
-          <div className="weather-goal-row weather-goal-row--api">
-
-            <label className="field weather-goal-location-field">
-              <span>Location</span>
-              <input
-                type="text"
-                value={locationInput}
-                onChange={(event) => {
-                  const value = event.target.value
-                  setLocationInput(value)
-                  localStorage.setItem('sippoWeatherLocation', value)
-                }}
-                placeholder="Karlsruhe"
-              />
-            </label>
-
-            <label className="field weather-goal-temp-field">
-              <span>Max temp (°C)</span>
-              <input
-                type="number"
-                min="-30"
-                max="60"
-                step="0.5"
-                value={maxTempInput}
-                onChange={(event) => {
-                  const value = event.target.value
-                  setMaxTempInput(value)
-                  localStorage.setItem('sippoMaxTempC', value)
-                }}
-                placeholder="28"
-              />
-            </label>
-
-            <StateCard
-              variant="sippo"
-              label="Weather bonus"
-              value={`+${weatherBonusPreviewMl} ml`}
-            />
-
-            <StateCard
-              variant="sippo"
-              label="New goal"
-              value={adjustedGoalPreviewMl === null ? '—' : `${adjustedGoalPreviewMl} ml`}
-            />
-
-            <div className="weather-goal-actions">
-              <button
-                type="button"
-                className="color-button weather-goal-button weather-goal-secondary-button"
-                onClick={fetchWeatherFromOpenMeteo}
-                disabled={isFetchingWeather}
-              >
-                {isFetchingWeather ? 'Fetching...' : 'Fetch'}
-              </button>
-
-              <button
-                type="button"
-                className="color-button weather-goal-button apply-button"
-                onClick={updateGoalFromManualTemperature}
-                disabled={isSending || isFetchingWeather}
-              >
-                Apply
-              </button>
-            </div>
-          </div>
-
-          {weatherLocationLabel && (
-            <p className="weather-location-hint">
-              Weather location: {weatherLocationLabel}
-            </p>
-          )}
-        </section>
-
-        <div className="sippo-dashboard">
-          <div className="sippo-main-row">
-            <section
-              className={`sippo-display ${isEmptyBottleWarning ? 'sippo-display--empty-warning' : ''
-                }`}
-              style={sippoDisplayStyle}
-            >
-              <div className="sippo-screen">
-                <img
-                  key={`${currentGif}-${gifVersion}`}
-                  src={currentGifSrc}
-                  alt={`Sippo ${currentGif}`}
-                  className="sippo-fish"
-                />
-              </div>
-
-              <div className="sippo-state-grid sippo-state-grid--tank">
-                <div>
-                  <span>Drank today</span>
-                  <strong>
-                    {sippoState?.totalDrankMl ?? 0}/
-                    {sippoState?.dailyGoalMl ?? 2000} ml
-                  </strong>
-                </div>
-
-                <div>
-                  <span>Bottle fill</span>
-                  <strong>{sippoState?.bottleFillPercent ?? 100}%</strong>
-                </div>
-
-                <div>
-                  <span>Goal</span>
-                  <strong>{sippoState?.goalPercent ?? 0}%</strong>
-                </div>
-              </div>
-            </section>
-
-            <aside className="sippo-sidebar sippo-sidebar--state-panel">
-              <div className="state-panel-header">
-                <div>
-                  <p className="state-panel-kicker">Live telemetry</p>
-                  <h2>State overview</h2>
-                </div>
-
-                <div className="state-panel-legend" aria-label="State categories">
-                  <span className="state-panel-legend__item state-panel-legend__item--sippo">
-                    Sippo
-                  </span>
-                  <span className="state-panel-legend__item state-panel-legend__item--bottle">
-                    Bottle
-                  </span>
-                  <span className="state-panel-legend__item state-panel-legend__item--debug">
-                    Debug
-                  </span>
-                </div>
-              </div>
-
-              <div className="sippo-state-grid sippo-state-grid--sidebar sippo-state-grid--compact">
-                <StateCard
-                  variant="sippo"
-                  label="Mood"
-                  value={sippoState?.mood || 'content'}
+            <label className="field ip-field">
+              <span>Arduino backend URL</span>
+              <div className="ip-field-wrapper">
+                <input
+                  value={arduinoBaseUrl}
+                  onChange={(event) => {
+                    const value = event.target.value
+                    setArduinoBaseUrl(value)
+                    localStorage.setItem('sippoArduinoBaseUrl', value)
+                  }}
+                  placeholder="http://192.168.4.1"
                 />
 
-                <StateCard
-                  variant="sippo"
-                  label="Mode"
-                  value={sippoState?.mode || 'awake'}
-                />
-
-                <StateCard
-                  variant="sippo"
-                  label="Reminder"
-                  value={sippoState?.reminderLevel ?? 0}
-                />
-
-                <StateCard
-                  variant="bottle"
-                  label="Bottle present"
-                  value={bottlePresentLabel}
-                />
-
-                <StateCard
-                  variant="bottle"
-                  label="Water"
-                  value={formatMl(sippoState?.estimatedWaterMl)}
-                />
-
-                <StateCard
-                  variant="bottle"
-                  label="Scale fill"
-                  value={`${sippoState?.estimatedBottleFillPercent ?? '—'}%`}
-                />
-
-                <StateCard
-                  variant="bottle"
-                  label="Weight"
-                  value={formatWeight(sippoState?.smoothedWeightGrams)}
-                />
-
-                <StateCard
-                  variant="debug"
-                  label="Scale"
-                  value={scaleReadyLabel}
-                />
-
-                <StateCard
-                  variant="debug"
-                  label="Tared"
-                  value={scaleTaredLabel}
-                />
-
-                <StateCard
-                  variant="debug"
-                  label="Auto"
-                  value={scaleAutoLabel}
-                />
-
-                <StateCard
-                  variant="debug"
-                  label="Raw"
-                  value={formatWeight(sippoState?.weightGrams)}
-                />
-
-                <StateCard
-                  variant="debug"
-                  label="Delta"
-                  value={formatDelta(sippoState?.scaleDeltaSinceLastBottleWeightGrams)}
-                />
-
-                <StateCard
-                  variant="debug"
-                  label="Last event"
-                  value={sippoState?.lastScaleEvent || 'none'}
-                />
-
-                <StateCard
-                  variant="debug"
-                  label="Age"
-                  value={formatAgeMs(sippoState?.scaleLastReadAgeMs)}
-                />
-              </div>
-            </aside>
-          </div>
-
-          <div className="sippo-actions">
-            <div className="button-grid sippo-action-grid">
-              {sippoEventCommands.map((command) => (
                 <button
-                  key={command.key}
                   type="button"
                   className="color-button"
-                  onClick={() => sendSippoEvent(command)}
-                  disabled={isSending}
+                  onClick={() => {
+                    localStorage.removeItem('sippoArduinoBaseUrl')
+                    setArduinoBaseUrl('')
+                    setStatusMessage('Cached Arduino URL cleared')
+                  }}
                 >
-                  {command.label}
+                  Clear saved IP
                 </button>
-              ))}
+              </div>
+            </label>
+
+            <section className="weather-goal-card">
+              <div className="state-panel-header">
+                <div>
+                  <h2>Personalize drinking goal</h2>
+                </div>
+              </div>
+
+              <p className="weather-goal-hint">
+                Set your body profile and activity first. Then add today's weather or fetch it from Open-Meteo before applying the new goal.
+              </p>
+
+              <div className="goal-profile-row">
+                <label className="field goal-profile-field">
+                  <span>Gender</span>
+                  <select
+                    value={goalGender}
+                    onChange={(event) => {
+                      const value = event.target.value as GoalGender
+                      setGoalGender(value)
+                      localStorage.setItem('sippoGoalGender', value)
+                    }}
+                  >
+                    <option value="female">Female</option>
+                    <option value="male">Male</option>
+                    <option value="other">Other / prefer not to say</option>
+                  </select>
+                </label>
+
+                <label className="field goal-profile-field">
+                  <span>Height (cm)</span>
+                  <input
+                    type="number"
+                    min="120"
+                    max="230"
+                    step="0.5"
+                    value={goalHeightCmInput}
+                    onChange={(event) => {
+                      const value = event.target.value
+                      setGoalHeightCmInput(value)
+                      localStorage.setItem('sippoGoalHeightCm', value)
+                    }}
+                    placeholder="170"
+                  />
+                </label>
+
+                <label className="field goal-profile-field">
+                  <span>Bodyweight (kg)</span>
+                  <input
+                    type="number"
+                    min="30"
+                    max="250"
+                    step="0.1"
+                    value={goalWeightKgInput}
+                    onChange={(event) => {
+                      const value = event.target.value
+                      setGoalWeightKgInput(value)
+                      localStorage.setItem('sippoGoalWeightKg', value)
+                    }}
+                    placeholder="70"
+                  />
+                </label>
+
+                <label className="field goal-profile-field">
+                  <span>Activity type</span>
+                  <select
+                    value={goalActivityType}
+                    onChange={(event) => {
+                      const value = event.target.value as ActivityType
+                      setGoalActivityType(value)
+                      localStorage.setItem('sippoGoalActivityType', value)
+                    }}
+                  >
+                    <option value="none">None</option>
+                    <option value="light">Light activity</option>
+                    <option value="hard">Hard activity</option>
+                  </select>
+                </label>
+
+                <label className="field goal-profile-field">
+                  <span>Activity minutes</span>
+                  <input
+                    type="number"
+                    min="0"
+                    max="240"
+                    step="15"
+                    value={goalActivityMinutesInput}
+                    onChange={(event) => {
+                      const value = event.target.value
+                      setGoalActivityMinutesInput(value)
+                      localStorage.setItem('sippoGoalActivityMinutes', value)
+                    }}
+                    placeholder="30"
+                  />
+                </label>
+
+                <StateCard
+                  variant="sippo"
+                  label="Baseline"
+                  value={baseGoalPreviewMl === null ? '—' : `${baseGoalPreviewMl} ml`}
+                />
+
+                <StateCard
+                  variant="bottle"
+                  label="Activity bonus"
+                  value={`+${activityBonusPreviewMl} ml`}
+                />
+              </div>
+
+              <div className="weather-goal-row weather-goal-row--api">
+                <label className="field weather-goal-location-field">
+                  <span>Location</span>
+                  <input
+                    type="text"
+                    value={locationInput}
+                    onChange={(event) => {
+                      const value = event.target.value
+                      setLocationInput(value)
+                      localStorage.setItem('sippoWeatherLocation', value)
+                    }}
+                    placeholder="Karlsruhe"
+                  />
+                </label>
+
+                <label className="field weather-goal-temp-field">
+                  <span>Max temp (°C)</span>
+                  <input
+                    type="number"
+                    min="-30"
+                    max="60"
+                    step="0.5"
+                    value={maxTempInput}
+                    onChange={(event) => {
+                      const value = event.target.value
+                      setMaxTempInput(value)
+                      localStorage.setItem('sippoMaxTempC', value)
+                    }}
+                    placeholder="28"
+                  />
+                </label>
+
+                <StateCard
+                  variant="sippo"
+                  label="Weather bonus"
+                  value={`+${weatherBonusPreviewMl} ml`}
+                />
+
+                <StateCard
+                  variant="sippo"
+                  label="New goal"
+                  value={adjustedGoalPreviewMl === null ? '—' : `${adjustedGoalPreviewMl} ml`}
+                />
+
+                <div className="weather-goal-actions">
+                  <button
+                    type="button"
+                    className="color-button weather-goal-button weather-goal-secondary-button"
+                    onClick={fetchWeatherFromOpenMeteo}
+                    disabled={isFetchingWeather}
+                  >
+                    {isFetchingWeather ? 'Fetching...' : 'Fetch'}
+                  </button>
+
+                  <button
+                    type="button"
+                    className="color-button weather-goal-button apply-button"
+                    onClick={updateGoalFromPersonalizedInputs}
+                    disabled={isSending || isFetchingWeather}
+                  >
+                    Apply
+                  </button>
+                </div>
+              </div>
+
+              {weatherLocationLabel && (
+                <p className="weather-location-hint">
+                  Weather location: {weatherLocationLabel}
+                </p>
+              )}
+            </section>
+          </section>
+
+          <div className="sippo-dashboard">
+            <div className="sippo-main-row">
+              <section
+                className={`sippo-display ${isEmptyBottleWarning ? 'sippo-display--empty-warning' : ''
+                  } ${isRefillDetectedReaction ? 'sippo-display--refill-detected' : ''
+                  }`}
+                style={sippoDisplayStyle}
+              >
+                <div className="sippo-screen">
+                  <img
+                    key={`${currentGif}-${gifVersion}`}
+                    src={currentGifSrc}
+                    alt={`Sippo ${currentGif}`}
+                    className="sippo-fish"
+                  />
+                </div>
+
+                <div className="sippo-state-grid sippo-state-grid--tank">
+                  <div>
+                    <span>Drank today</span>
+                    <strong>
+                      {sippoState?.totalDrankMl ?? 0}/
+                      {sippoState?.dailyGoalMl ?? 2000} ml
+                    </strong>
+                  </div>
+
+                  <div>
+                    <span>Bottle fill</span>
+                    <strong>{sippoState?.bottleFillPercent ?? 100}%</strong>
+                  </div>
+
+                  <div>
+                    <span>Goal</span>
+                    <strong>{sippoState?.goalPercent ?? 0}%</strong>
+                  </div>
+                </div>
+              </section>
+
+              <aside className="sippo-sidebar sippo-sidebar--state-panel">
+                <div className="state-panel-header">
+                  <div>
+                    <p className="state-panel-kicker">Live telemetry</p>
+                    <h2>State overview</h2>
+                  </div>
+
+                  <div className="state-panel-legend" aria-label="State categories">
+                    <span className="state-panel-legend__item state-panel-legend__item--sippo">
+                      Sippo
+                    </span>
+                    <span className="state-panel-legend__item state-panel-legend__item--bottle">
+                      Bottle
+                    </span>
+                    <span className="state-panel-legend__item state-panel-legend__item--debug">
+                      Debug
+                    </span>
+                  </div>
+                </div>
+
+                <div className="sippo-state-grid sippo-state-grid--sidebar sippo-state-grid--compact">
+                  <StateCard
+                    variant="sippo"
+                    label="Mood"
+                    value={sippoState?.mood || 'content'}
+                  />
+
+                  <StateCard
+                    variant="sippo"
+                    label="Mode"
+                    value={sippoState?.mode || 'awake'}
+                  />
+
+                  <StateCard
+                    variant="sippo"
+                    label="Reminder"
+                    value={sippoState?.reminderLevel ?? 0}
+                  />
+
+                  <StateCard
+                    variant="bottle"
+                    label="Bottle present"
+                    value={bottlePresentLabel}
+                  />
+
+                  <StateCard
+                    variant="bottle"
+                    label="Water"
+                    value={formatMl(sippoState?.estimatedWaterMl)}
+                  />
+
+                  <StateCard
+                    variant="bottle"
+                    label="Scale fill"
+                    value={`${sippoState?.estimatedBottleFillPercent ?? '—'}%`}
+                  />
+
+                  <StateCard
+                    variant="bottle"
+                    label="Weight"
+                    value={formatWeight(sippoState?.smoothedWeightGrams)}
+                  />
+
+                  <StateCard
+                    variant="debug"
+                    label="Scale"
+                    value={scaleReadyLabel}
+                  />
+
+                  <StateCard
+                    variant="debug"
+                    label="Tared"
+                    value={scaleTaredLabel}
+                  />
+
+                  <StateCard
+                    variant="debug"
+                    label="Auto"
+                    value={scaleAutoLabel}
+                  />
+
+                  <StateCard
+                    variant="debug"
+                    label="Raw"
+                    value={formatWeight(sippoState?.weightGrams)}
+                  />
+
+                  <StateCard
+                    variant="debug"
+                    label="Delta"
+                    value={formatDelta(sippoState?.scaleDeltaSinceLastBottleWeightGrams)}
+                  />
+
+                  <StateCard
+                    variant="debug"
+                    label="Last event"
+                    value={sippoState?.lastScaleEvent || 'none'}
+                  />
+
+                  <StateCard
+                    variant="debug"
+                    label="Age"
+                    value={formatAgeMs(sippoState?.scaleLastReadAgeMs)}
+                  />
+                </div>
+              </aside>
+            </div>
+
+            <div className="sippo-actions">
+              <div className="button-grid sippo-action-grid">
+                {sippoEventCommands.map((command) => (
+                  <button
+                    key={command.key}
+                    type="button"
+                    className="color-button"
+                    onClick={() => sendSippoEvent(command)}
+                    disabled={isSending}
+                  >
+                    {command.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="status-box">
+                <strong>Status:</strong> {statusMessage}
+              </div>
+
             </div>
           </div>
-        </div>
-
-        <div className="status-box">
-          <strong>Status:</strong> {statusMessage}
         </div>
 
         {errorMessage && (
