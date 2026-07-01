@@ -29,7 +29,7 @@ WiFiServer server(80);
 
 const int LED_RING_PIN = 3;
 const int LED_RING_PIXEL_COUNT = 16;
-const int LED_RING_BRIGHTNESS = 50;
+const int LED_RING_BRIGHTNESS = 40;
 
 Adafruit_NeoPixel ledRing(
   LED_RING_PIXEL_COUNT,
@@ -141,7 +141,7 @@ const unsigned long REMINDER_2_AFTER_MS = 60UL * 1000UL;
 const unsigned long REMINDER_3_AFTER_MS = 90UL * 1000UL;
 
 const unsigned long HAPPY_ANIMATION_MS = 5000UL;
-const unsigned long REFILL_ANIMATION_MS = 4000UL;
+const unsigned long REFILL_ANIMATION_MS = 5500UL;
 const unsigned long GOAL_ANIMATION_MS = 8000UL;
 
 // Bottle-low warning animation.
@@ -150,6 +150,15 @@ const int EMPTY_WARNING_RED = 255;
 const int EMPTY_WARNING_GREEN = 55;
 const int EMPTY_WARNING_BLUE = 0;
 const unsigned long EMPTY_WARNING_PULSE_MS = 1000UL;
+
+// Refill-detected LED animation.
+// This is separate from the empty-bottle warning. Empty still uses the
+// red/orange pulse above. Actual scale refills use this temporary dark-green
+// pulse while Sippo is in MOOD_REFILL.
+const int REFILL_DETECTED_RED = 0;
+const int REFILL_DETECTED_GREEN = 150;
+const int REFILL_DETECTED_BLUE = 55;
+const unsigned long REFILL_DETECTED_PULSE_MS = 700UL;
 
 // ------------------------------------------------------------
 // Sippo state machine types
@@ -623,6 +632,27 @@ void applyEmptyBottleWarningOutput() {
   setRGB(red, green, blue);
 }
 
+void applyRefillDetectedOutput() {
+  unsigned long phase = millis() % REFILL_DETECTED_PULSE_MS;
+
+  // Triangle wave: dark green -> brighter green -> dark green.
+  // This keeps the refill feedback non-blocking and lets the webserver
+  // continue responding while the LED ring blinks.
+  int pulse;
+
+  if (phase < REFILL_DETECTED_PULSE_MS / 2) {
+    pulse = map(phase, 0, REFILL_DETECTED_PULSE_MS / 2, 35, 255);
+  } else {
+    pulse = map(phase, REFILL_DETECTED_PULSE_MS / 2, REFILL_DETECTED_PULSE_MS, 255, 35);
+  }
+
+  int red = (REFILL_DETECTED_RED * pulse) / 255;
+  int green = (REFILL_DETECTED_GREEN * pulse) / 255;
+  int blue = (REFILL_DETECTED_BLUE * pulse) / 255;
+
+  setRGB(red, green, blue);
+}
+
 void applyMoodOutput() {
   switch (sippo.mood) {
     case MOOD_CONTENT:
@@ -654,7 +684,7 @@ void applyMoodOutput() {
       break;
 
     case MOOD_REFILL:
-      setRGB(0, 201, 204);
+      applyRefillDetectedOutput();
       break;
 
     case MOOD_EMPTY:
@@ -946,7 +976,7 @@ const char* moodToHex(SippoMood mood) {
       return "#01FF00";
 
     case MOOD_REFILL:
-      return "#00C9CC";
+      return "#063D24";
 
     case MOOD_EMPTY:
       return "#FF3700";
@@ -1177,18 +1207,17 @@ void handleClient(WiFiClient& client) {
     client.println(F("{\"status\":\"ok\"}"));
   }
 
-
-  else if (requestLine.startsWith("GET /api/config/goal")) {
+  else if (
+    requestLine.startsWith("GET /api/config/goal") || requestLine.startsWith("GET /api/config/personalized-goal")) {
     int requestedGoalMl = parseQueryIntParam(requestLine, "ml", -1);
 
     if (requestedGoalMl <= 0) {
       sendStateJson(client, "Missing or invalid goal ml value");
-      return;
+    } else {
+      setDailyGoalMl(requestedGoalMl);
+      updateSippoStateMachine();
+      sendStateJson(client, "Daily goal updated");
     }
-
-    setDailyGoalMl(requestedGoalMl);
-    updateSippoStateMachine();
-    sendStateJson(client, "Daily goal updated");
   }
 
   else if (requestLine.startsWith("GET /api/state")) {
